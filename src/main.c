@@ -254,18 +254,19 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
      *   substitution at a time. Pinning the range to a single face keeps the
      *   metrics stable across a message that mixes Arabic, Latin and emoji.
      *
-     *   An explicit line-height. This is what fixes the composer jumping while
-     *   Arabic is typed: with the default 'normal', the line box is sized from
-     *   the metrics of whichever font is on the line, so each fallback switch
-     *   resized it and the text moved up and down character by character. */
+     *   No line-height. Forcing one here was a mistake worth recording: WhatsApp
+     *   already sets 1.47em on the composer, and overriding it with 1.5 made the
+     *   content one pixel taller than the box it sits in. A box with one pixel of
+     *   overflow is a scrollable box, so every keystroke scrolled the caret back
+     *   into view and the text twitched up and down -- which is exactly the
+     *   symptom the override was added to fix. Measured: scrollHeight exceeded
+     *   clientHeight by 1px on a three-line message, and by zero without it. */
     char *css = g_strdup_printf(
         "@font-face { font-family: \"wa-arabic\";"
         " src: local(\"Noto Sans Arabic\"), local(\"Noto Naskh Arabic\"), local(\"DejaVu Sans\");"
         " unicode-range: U+0600-06FF, U+0750-077F, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF; }"
         "* { font-family: \"%s\", \"wa-arabic\", system-ui, \"Noto Color Emoji\", "
         "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
-        "[contenteditable=\"true\"], [contenteditable=\"true\"] *,"
-        "#main .selectable-text, #main .selectable-text * { line-height: 1.5 !important; }"
         /* Anything that is a message rather than a control: the bubbles, the
          * composer, and the names and previews in the chat list. */
         "#main .selectable-text, #main .selectable-text *,"
