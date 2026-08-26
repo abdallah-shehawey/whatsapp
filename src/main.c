@@ -1276,6 +1276,25 @@ main(int argc, char **argv)
     self.app = gtk_application_new(WA_APP_ID, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(self.app, "activate", G_CALLBACK(on_activate), &self);
 
+    /* A --hidden launch must never raise a window, not even the window of an
+     * instance that is already running. Activation is how a second launch
+     * normally reaches the first one, and that path shows the window -- so with
+     * the package's system-wide autostart entry and a per-user one both present,
+     * logging in would pop the window open instead of starting in the tray. */
+    if (self.start_hidden) {
+        GError *error = NULL;
+        if (!g_application_register(G_APPLICATION(self.app), NULL, &error)) {
+            g_warning("could not register the application: %s",
+                      error ? error->message : "unknown");
+            g_clear_error(&error);
+        } else if (g_application_get_is_remote(G_APPLICATION(self.app))) {
+            g_message("already running; leaving the running instance alone");
+            g_object_unref(self.app);
+            g_free(self.config_path);
+            return 0;
+        }
+    }
+
     int status = g_application_run(G_APPLICATION(self.app), argc, argv);
 
     wa_tray_free(self.tray);
