@@ -1,5 +1,5 @@
 /*
- * wa-lite -- a small WhatsApp Web client for GTK4 + WebKitGTK 6.
+ * whatsapp -- a small WhatsApp Web client for GTK4 + WebKitGTK 6.
  *
  * Two things it does differently from the packaged clients:
  *
@@ -8,7 +8,7 @@
  *   webkit2gtk 2.52.5, so WhatsApp's handler finds nothing and drops it. Worse,
  *   WhatsApp's composer is plaintext-only, so WebKit does not even do its usual
  *   fallback of inserting an <img src="blob:"> that could be scraped back out.
- *   wa-lite therefore never asks WebKit for the clipboard at all: it reads the
+ *   whatsapp therefore never asks WebKit for the clipboard at all: it reads the
  *   image on the GTK side, where the data is plainly available, and hands the
  *   bytes to the page itself.
  *
@@ -18,15 +18,17 @@
  *   on the packaged client drove memory.pressure to full avg10=63, i.e. frozen
  *   roughly two thirds of the time, while cpu.pressure stayed at zero.
  */
+#include <stdlib.h>
+
 #include <gtk/gtk.h>
 #include <webkit/webkit.h>
 
 #include "inject.js.h"
 #include "tray.h"
 
-#define WA_APP_ID     "io.github.shehawey.walite"
-#define WA_ICON_NAME  "io.github.shehawey.walite"
-#define WA_TRAY_ICON  "io.github.shehawey.walite-tray"
+#define WA_APP_ID     "io.github.shehawey.whatsapp"
+#define WA_ICON_NAME  "io.github.shehawey.whatsapp"
+#define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
 #define WA_URL        "https://web.whatsapp.com/"
 
@@ -276,7 +278,7 @@ deliver_image_to_page(WaApp *self, const guchar *data, gsize length, const char 
     g_variant_builder_add(&builder, "{sv}", "mime", g_variant_new_string(mime));
 
     webkit_web_view_call_async_javascript_function(
-        self->view, "return window.__waLitePasteImage(b64, mime);", -1,
+        self->view, "return window.__whatsappPasteImage(b64, mime);", -1,
         g_variant_builder_end(&builder), NULL, NULL, NULL, NULL, NULL);
 
     g_message("pasted %" G_GSIZE_FORMAT " bytes of %s into the page", length, mime);
@@ -509,14 +511,20 @@ configure_memory_pressure(void)
 
 /* WhatsApp Web puts "(3) WhatsApp" in the document title while chats are unread
  * and drops the prefix once they are read. That is the only unread signal the
- * page hands us without scraping its DOM, and it is what drives the tray badge. */
+ * page hands us without scraping its DOM, and it drives both the tray icon and
+ * the dock badge. */
 static void
 on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
     WaApp *self = user_data;
     const char *title = webkit_web_view_get_title(self->view);
 
-    wa_tray_set_attention(self->tray, title && title[0] == '(');
+    /* Anything non-numeric inside the parentheses -- "(99+)" and the like --
+     * still counts as unread, just without an exact number. */
+    int unread = 0;
+    if (title && title[0] == '(')
+        unread = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
+    wa_tray_set_unread(self->tray, unread);
 
     if (self->window)
         gtk_window_set_title(self->window, (title && *title) ? title : WA_TITLE);
@@ -547,8 +555,8 @@ build_window(WaApp *self)
         g_signal_connect(interface, "changed::color-scheme",
                          G_CALLBACK(on_color_scheme_changed), NULL);
 
-    char *data_dir  = g_build_filename(g_get_user_data_dir(),  "wa-lite", NULL);
-    char *cache_dir = g_build_filename(g_get_user_cache_dir(), "wa-lite", NULL);
+    char *data_dir  = g_build_filename(g_get_user_data_dir(),  "whatsapp", NULL);
+    char *cache_dir = g_build_filename(g_get_user_cache_dir(), "whatsapp", NULL);
     WebKitNetworkSession *session = webkit_network_session_new(data_dir, cache_dir);
     g_signal_connect(session, "download-started", G_CALLBACK(on_download_started), self);
     g_free(data_dir);
@@ -569,11 +577,11 @@ build_window(WaApp *self)
     webkit_settings_set_media_playback_requires_user_gesture(settings, FALSE);
 
     WebKitUserContentManager *content = webkit_user_content_manager_new();
-    webkit_user_content_manager_register_script_message_handler(content, "walite", NULL);
-    g_signal_connect(content, "script-message-received::walite",
+    webkit_user_content_manager_register_script_message_handler(content, "whatsapp", NULL);
+    g_signal_connect(content, "script-message-received::whatsapp",
                      G_CALLBACK(on_script_message), self);
-    webkit_user_content_manager_register_script_message_handler(content, "walitePaste", NULL);
-    g_signal_connect(content, "script-message-received::walitePaste",
+    webkit_user_content_manager_register_script_message_handler(content, "whatsappPaste", NULL);
+    g_signal_connect(content, "script-message-received::whatsappPaste",
                      G_CALLBACK(on_paste_request), self);
 
     char *font_spec = resolve_font(self);
@@ -662,7 +670,8 @@ on_activate(GtkApplication *app, gpointer user_data)
         build_window(self);
 
         static const WaTrayCallbacks callbacks = { on_tray_activate, on_tray_quit };
-        self->tray = wa_tray_new(WA_TRAY_ICON, WA_TITLE, &callbacks, self);
+        self->tray = wa_tray_new(WA_TRAY_ICON, WA_TITLE, WA_APP_ID ".desktop",
+                                 &callbacks, self);
 
         /* Without a held reference GtkApplication would exit as soon as the
          * window is hidden, taking the tray icon and notifications with it. */
@@ -702,7 +711,7 @@ main(int argc, char **argv)
 
     g_set_application_name(WA_TITLE);
 
-    self.config_path = g_build_filename(g_get_user_config_dir(), "wa-lite", "wa-lite.conf", NULL);
+    self.config_path = g_build_filename(g_get_user_config_dir(), "whatsapp", "whatsapp.conf", NULL);
     self.app = gtk_application_new(WA_APP_ID, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(self.app, "activate", G_CALLBACK(on_activate), &self);
 

@@ -2,11 +2,11 @@
 Type=Application
 Name=WhatsApp
 Comment=WhatsApp Web
-Exec=@BINDIR@/wa-lite %u
-Icon=io.github.shehawey.walite
+Exec=@BINDIR@/whatsapp %u
+Icon=io.github.shehawey.whatsapp
 Terminal=false
 Categories=Network;InstantMessaging;
 Keywords=whatsapp;chat;messaging;
 StartupNotify=true
-StartupWMClass=io.github.shehawey.walite
+StartupWMClass=io.github.shehawey.whatsapp
 SingleMainWindow=true

@@ -1,4 +1,4 @@
-# wa-lite -- lightweight WhatsApp Web client
+# whatsapp -- lightweight WhatsApp Web client
 #
 # The generated inject.js.h keeps the page-side JavaScript in its own file
 # instead of a C string literal, so it stays readable and lintable.
@@ -11,7 +11,7 @@ DESTDIR ?=
 CFLAGS  += -O2 -Wall -Wextra -Wno-unused-parameter $(shell pkg-config --cflags $(PKGS))
 LDFLAGS += $(shell pkg-config --libs $(PKGS))
 
-BIN = wa-lite
+BIN = whatsapp
 SRC = src/main.c src/tray.c
 GEN = src/inject.js.h
 
@@ -27,7 +27,7 @@ $(BIN): $(SRC) $(GEN)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 	@echo "  CC   $(BIN)  ($$(stat -c%s $(BIN)) bytes)"
 
-APP_ID  = io.github.shehawey.walite
+APP_ID  = io.github.shehawey.whatsapp
 
 # Runtime paths, kept separate from DESTDIR so a staged package install still
 # writes the real prefix into the desktop entry.

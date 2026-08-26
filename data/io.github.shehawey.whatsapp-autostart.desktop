@@ -2,8 +2,8 @@
 Type=Application
 Name=WhatsApp
 Comment=Start WhatsApp in the background at login
-Exec=@BINDIR@/wa-lite --hidden
-Icon=io.github.shehawey.walite
+Exec=@BINDIR@/whatsapp --hidden
+Icon=io.github.shehawey.whatsapp
 Terminal=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true

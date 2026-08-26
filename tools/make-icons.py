@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate wa-lite's icon set from the two masters in data/icons.
+"""Generate whatsapp's icon set from the two masters in data/icons.
 
 The launcher and the tray deliberately do not share artwork: the launcher gets
 the plated icon that suits an app grid, the tray gets the bare mark that still
@@ -21,7 +21,7 @@ from gi.repository import GdkPixbuf
 import cairo
 
 SIZES = (16, 22, 24, 32, 48, 64, 128, 256)
-APP_ID = "io.github.shehawey.walite"
+APP_ID = "io.github.shehawey.whatsapp"
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ICONS = ROOT / "data" / "icons"

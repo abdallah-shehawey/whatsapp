@@ -1,17 +1,17 @@
 /*
- * Page-side helpers for wa-lite.
+ * Page-side helpers for whatsapp.
  *
  * The paste entry point exists because WebKitGTK hands the page an empty
  * clipboardData for images: a real Ctrl+V fires `paste` with
  * types=[] items=[] files=[], so WhatsApp's own handler finds nothing and drops
- * it. Rather than fight WebKit's clipboard, wa-lite reads the image on the GTK
+ * it. Rather than fight WebKit's clipboard, whatsapp reads the image on the GTK
  * side and calls in here with the bytes already decoded.
  */
 (() => {
   'use strict';
 
   const log = m => {
-    try { window.webkit.messageHandlers.walite.postMessage(String(m)); } catch (e) {}
+    try { window.webkit.messageHandlers.whatsapp.postMessage(String(m)); } catch (e) {}
   };
 
   const findComposer = () => {
@@ -25,7 +25,7 @@
   };
 
   /* Called from C with base64 image bytes lifted straight off the GTK clipboard. */
-  window.__waLitePasteImage = (b64, mime) => {
+  window.__whatsappPasteImage = (b64, mime) => {
     let bytes;
     try {
       const bin = atob(b64);
@@ -47,7 +47,7 @@
     // define it on a plain event instead.
     const ev = new Event('paste', { bubbles: true, cancelable: true });
     Object.defineProperty(ev, 'clipboardData', { value: carrier });
-    ev.__waLiteSynthetic = true;
+    ev.__whatsappSynthetic = true;
 
     const target = findComposer();
     target.dispatchEvent(ev);
@@ -67,13 +67,13 @@
   /* WebKitGTK hands the page an empty clipboardData for images. Report those
      pastes so the app can supply the bytes from the GTK clipboard instead. */
   document.addEventListener('paste', ev => {
-    if (ev.__waLiteSynthetic) return;
+    if (ev.__whatsappSynthetic) return;
     const dt = ev.clipboardData;
     if (dt && (dt.files.length || dt.types.length)) return;   // nothing wrong here
     ev.preventDefault();
     ev.stopImmediatePropagation();
     log('paste: clipboardData empty, asking the app');
-    try { window.webkit.messageHandlers.walitePaste.postMessage('image'); } catch (e) {}
+    try { window.webkit.messageHandlers.whatsappPaste.postMessage('image'); } catch (e) {}
   }, true);
 
   /* WhatsApp Web suppresses desktop notifications while it believes the window
