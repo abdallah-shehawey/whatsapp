@@ -103,8 +103,7 @@ State lives in `~/.local/share/whatsapp`, config in `~/.config/whatsapp`.
 
 | Key | Default | What it does |
 |---|---|---|
-| `[view] font` | the GNOME interface font | family for the interface |
-| `[view] chat-font` | `"Noto Sans", "Noto Sans Arabic", system-ui` | family for message text, the composer and the chat list |
+| `[view] font` | the GNOME interface font | family for everything the client draws |
 | `[view] font-size` | `16` | root font size in pixels — WhatsApp sizes in rem, so this scales the client |
 | `[view] zoom` | `1.0` | WebKit zoom level, also set with `Ctrl` `+`/`-` |
 | `[window] width`, `[window] height` | `1200x800` | remembered on exit |

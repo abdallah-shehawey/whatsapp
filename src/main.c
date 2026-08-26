@@ -189,29 +189,6 @@ resolve_font(WaApp *self)
  * the web assumes, shrinking every message to 81% of its intended size. */
 #define WA_DEFAULT_FONT_PX  16
 
-/* The interface font and the reading font are deliberately separate. A display
- * face like PoetsenOne is a fine choice for a desktop, and a poor one for a chat:
- * it carries no Arabic at all, so an Arabic message was drawn in a fallback while
- * the digits and punctuation inside the same sentence stayed in the display face
- * -- one sentence in two unrelated typefaces. Message text, the composer and the
- * chat list therefore use a family that covers both scripts in one design. */
-#define WA_DEFAULT_CHAT_FONT  "\"Noto Sans\", \"Noto Sans Arabic\", system-ui"
-
-static char *
-resolve_chat_font(WaApp *self)
-{
-    GKeyFile *keys = g_key_file_new();
-    char *font = NULL;
-    if (g_key_file_load_from_file(keys, self->config_path, G_KEY_FILE_NONE, NULL))
-        font = g_key_file_get_string(keys, "view", "chat-font", NULL);
-    g_key_file_free(keys);
-
-    if (font && *font)
-        return font;
-    g_free(font);
-    return g_strdup(WA_DEFAULT_CHAT_FONT);
-}
-
 static int
 resolve_font_size(WaApp *self)
 {
@@ -228,10 +205,17 @@ resolve_font_size(WaApp *self)
  * not enough to change what is actually drawn -- a user-level sheet is. The
  * fallbacks matter: a display face like PoetsenOne carries no Arabic glyphs, and
  * fontconfig only substitutes per-glyph if something further down the list has
- * them. */
+ * them.
+ *
+ * One family, everywhere. Message text briefly had a separate reading face, on
+ * the theory that a display font is a poor choice for a chat -- but the browser
+ * this client is meant to be indistinguishable from is configured to ignore page
+ * fonts entirely, so it draws bubbles, previews and controls in the desktop font
+ * alike. Splitting them here was the only visible difference left between the
+ * two, so the split is gone. */
 static void
 apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
-           const char *font_spec, const char *chat_font, int pixels)
+           const char *font_spec, int pixels)
 {
     PangoFontDescription *desc = pango_font_description_from_string(font_spec);
     const char *family = pango_font_description_get_family(desc);
@@ -266,22 +250,14 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
         " src: local(\"Noto Sans Arabic\"), local(\"Noto Naskh Arabic\"), local(\"DejaVu Sans\");"
         " unicode-range: U+0600-06FF, U+0750-077F, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF; }"
         "* { font-family: \"%s\", \"wa-arabic\", system-ui, \"Noto Color Emoji\", "
-        "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
-        /* Anything that is a message rather than a control: the bubbles, the
-         * composer, and the names and previews in the chat list. */
-        "#main .selectable-text, #main .selectable-text *,"
-        "[contenteditable=\"true\"], [contenteditable=\"true\"] *,"
-        "#pane-side [role=\"row\"] span[title],"
-        "#pane-side [role=\"row\"] span[title] * {"
-        " font-family: %s, \"Noto Color Emoji\", \"Apple Color Emoji\","
-        " \"Segoe UI Emoji\", sans-serif !important; }",
-        family, chat_font);
+        "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }",
+        family);
     WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
         css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
     webkit_user_content_manager_add_style_sheet(content, sheet);
     webkit_user_style_sheet_unref(sheet);
 
-    g_message("font: %s at %dpx, chat text in %s", family, pixels, chat_font);
+    g_message("font: %s at %dpx", family, pixels);
     g_free(css);
     pango_font_description_free(desc);
 }
@@ -1153,9 +1129,7 @@ build_window(WaApp *self)
                      G_CALLBACK(on_paste_request), self);
 
     char *font_spec = resolve_font(self);
-    char *chat_font = resolve_chat_font(self);
-    apply_font(settings, content, font_spec, chat_font, resolve_font_size(self));
-    g_free(chat_font);
+    apply_font(settings, content, font_spec, resolve_font_size(self));
     g_free(font_spec);
 
     WebKitUserScript *script = webkit_user_script_new(
