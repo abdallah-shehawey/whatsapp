@@ -76,19 +76,27 @@
     try { window.webkit.messageHandlers.whatsappPaste.postMessage('image'); } catch (e) {}
   }, true);
 
-  /* WhatsApp Web suppresses desktop notifications while it believes the window
-     is focused, so nothing arrives when the app is open and in front. Report the
-     document as unfocused and the notifications come through either way.
-     visibilityState is deliberately left alone: the page still knows it is
-     visible, so read receipts and sync keep behaving normally. */
-  try {
-    Object.defineProperty(document, 'hasFocus', {
-      configurable: true,
-      value: () => false,
-    });
-  } catch (err) {
-    log('could not override document.hasFocus: ' + err.message);
-  }
+  /* Report the chat behind the newest unread badge, so the app can name it in a
+     notification. Nothing here lies to the page: an earlier attempt forced
+     document.hasFocus() to false, which did make WhatsApp raise notifications
+     while the window was focused -- and also convinced it the user was not
+     looking, so opening a chat never marked it read. */
+  const unreadChat = () => {
+    const badge = document.querySelector('[aria-label*="unread"], [aria-label*="غير مقروءة"]');
+    const row = badge && badge.closest('[role="listitem"], [role="row"]');
+    const name = row && row.querySelector('span[title]');
+    return name ? name.getAttribute('title') : '';
+  };
+
+  const reportUnread = () => {
+    try {
+      window.webkit.messageHandlers.whatsappUnread.postMessage(unreadChat());
+    } catch (e) { /* handler only exists in the host app */ }
+  };
+
+  const title = document.querySelector('title');
+  if (title) new MutationObserver(reportUnread).observe(title, { childList: true });
+  addEventListener('DOMContentLoaded', reportUnread);
 
   log('UA: ' + navigator.userAgent);
   log('inject.js ready on ' + location.host);

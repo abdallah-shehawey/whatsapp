@@ -58,6 +58,8 @@ typedef struct {
     WebKitWebView  *view;
     WaTray         *tray;
     char           *config_path;
+    char           *unread_chat;
+    int             unread;
     gboolean        start_hidden;
 } WaApp;
 
@@ -449,6 +451,18 @@ on_paste_request(WebKitUserContentManager *manager, JSCValue *value, gpointer us
     paste_clipboard_image(self);
 }
 
+/* The page reports which chat is behind the newest unread badge, purely so a
+ * notification can name it. */
+static void
+on_unread_chat(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
+{
+    WaApp *self = user_data;
+    char *name = jsc_value_to_string(value);
+
+    g_free(self->unread_chat);
+    self->unread_chat = (name && *name) ? name : (g_free(name), NULL);
+}
+
 static void
 on_script_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
 {
@@ -509,6 +523,39 @@ configure_memory_pressure(void)
     webkit_memory_pressure_settings_free(pressure);
 }
 
+/* WhatsApp Web raises its own desktop notification whenever it believes the
+ * window is unfocused, and stays silent when it does not -- so this fills in
+ * exactly that gap and never doubles up. Forcing the page to always believe
+ * itself unfocused was tried first and is a trap: it does produce notifications,
+ * and it also convinces WhatsApp the user is not looking, so opening a chat
+ * never marks it read. */
+static void
+notify_unread(WaApp *self, int count)
+{
+    GNotification *note = g_notification_new(WA_TITLE);
+
+    if (self->unread_chat)
+        g_notification_set_body(note, self->unread_chat);
+    else if (count == 1)
+        g_notification_set_body(note, "You have a new message");
+    else {
+        char *body = g_strdup_printf("You have %d unread chats", count);
+        g_notification_set_body(note, body);
+        g_free(body);
+    }
+
+    GIcon *icon = g_themed_icon_new(WA_ICON_NAME);
+    g_notification_set_icon(note, icon);
+    g_notification_set_default_action(note, "app.present");
+
+    /* One reused id, so a burst of messages replaces the banner instead of
+     * stacking a dozen of them. */
+    g_application_send_notification(G_APPLICATION(self->app), "unread", note);
+
+    g_object_unref(icon);
+    g_object_unref(note);
+}
+
 /* WhatsApp Web puts "(3) WhatsApp" in the document title while chats are unread
  * and drops the prefix once they are read. That is the only unread signal the
  * page hands us without scraping its DOM, and it drives both the tray icon and
@@ -524,6 +571,11 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
     int unread = 0;
     if (title && title[0] == '(')
         unread = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
+
+    if (unread > self->unread && self->window && gtk_window_is_active(self->window))
+        notify_unread(self, unread);
+    self->unread = unread;
+
     wa_tray_set_unread(self->tray, unread);
 
     if (self->window)
@@ -583,6 +635,9 @@ build_window(WaApp *self)
     webkit_user_content_manager_register_script_message_handler(content, "whatsappPaste", NULL);
     g_signal_connect(content, "script-message-received::whatsappPaste",
                      G_CALLBACK(on_paste_request), self);
+    webkit_user_content_manager_register_script_message_handler(content, "whatsappUnread", NULL);
+    g_signal_connect(content, "script-message-received::whatsappUnread",
+                     G_CALLBACK(on_unread_chat), self);
 
     char *font_spec = resolve_font(self);
     apply_font(settings, content, font_spec);
@@ -661,6 +716,12 @@ on_tray_quit(gpointer user_data)
 }
 
 static void
+on_present_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+{
+    show_window(user_data);
+}
+
+static void
 on_activate(GtkApplication *app, gpointer user_data)
 {
     WaApp *self = user_data;
@@ -668,6 +729,12 @@ on_activate(GtkApplication *app, gpointer user_data)
 
     if (first_run) {
         build_window(self);
+
+        /* Clicking one of our notifications should raise the window. */
+        GSimpleAction *present = g_simple_action_new("present", NULL);
+        g_signal_connect(present, "activate", G_CALLBACK(on_present_action), self);
+        g_action_map_add_action(G_ACTION_MAP(app), G_ACTION(present));
+        g_object_unref(present);
 
         static const WaTrayCallbacks callbacks = { on_tray_activate, on_tray_quit };
         self->tray = wa_tray_new(WA_TRAY_ICON, WA_TITLE, WA_APP_ID ".desktop",
@@ -720,5 +787,6 @@ main(int argc, char **argv)
     wa_tray_free(self.tray);
     g_object_unref(self.app);
     g_free(self.config_path);
+    g_free(self.unread_chat);
     return status;
 }
