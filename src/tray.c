@@ -36,14 +36,12 @@ struct WaTray {
     char            *attention_icon;
     char            *title;
     char            *desktop_id;
-    char            *launcher_path;
     guint            own_id;
     guint            item_id;
     guint            menu_id;
     WaTrayCallbacks  callbacks;
     gpointer         user_data;
     gboolean         needs_attention;
-    int              unread;
 };
 
 static const char ITEM_XML[] =
@@ -327,32 +325,6 @@ on_name_acquired(GDBusConnection *bus, const char *name, gpointer user_data)
                            on_registered, tray);
 }
 
-/* The dock badge is a separate protocol from the tray icon: a broadcast
- * com.canonical.Unity.LauncherEntry signal, which Dash to Panel and Dash to Dock
- * both listen for. The object path carries a hash of the application URI, the
- * way libunity derives it -- hosts match on the interface, but keeping the
- * convention avoids surprising any that do look. */
-static void
-emit_launcher_badge(WaTray *tray, int count)
-{
-    if (!tray->launcher_path)
-        return;
-
-    GVariantBuilder props;
-    g_variant_builder_init(&props, G_VARIANT_TYPE("a{sv}"));
-    g_variant_builder_add(&props, "{sv}", "count", g_variant_new_int64(count));
-    g_variant_builder_add(&props, "{sv}", "count-visible", g_variant_new_boolean(count > 0));
-    g_variant_builder_add(&props, "{sv}", "urgent", g_variant_new_boolean(count > 0));
-
-    char *uri = g_strdup_printf("application://%s", tray->desktop_id);
-    g_dbus_connection_emit_signal(tray->bus, NULL, tray->launcher_path,
-                                  "com.canonical.Unity.LauncherEntry", "Update",
-                                  g_variant_new("(s@a{sv})", uri,
-                                                g_variant_builder_end(&props)),
-                                  NULL);
-    g_free(uri);
-}
-
 WaTray *
 wa_tray_new(const char *icon_name, const char *title, const char *desktop_id,
             const WaTrayCallbacks *callbacks, gpointer user_data)
@@ -372,10 +344,6 @@ wa_tray_new(const char *icon_name, const char *title, const char *desktop_id,
     tray->title          = g_strdup(title);
     tray->desktop_id     = g_strdup(desktop_id);
 
-    char *uri = g_strdup_printf("application://%s", desktop_id);
-    tray->launcher_path = g_strdup_printf("/com/canonical/unity/launcherentry/%u",
-                                          g_str_hash(uri));
-    g_free(uri);
     tray->callbacks = *callbacks;
     tray->user_data = user_data;
     /* The watcher keys items by bus name, and the convention is to include the
@@ -414,29 +382,22 @@ wa_tray_new(const char *icon_name, const char *title, const char *desktop_id,
 }
 
 void
-wa_tray_set_unread(WaTray *tray, int count)
+wa_tray_set_attention(WaTray *tray, gboolean unread)
 {
-    if (!tray || tray->unread == count)
+    if (!tray || tray->needs_attention == !!unread)
         return;
 
-    tray->unread = count;
-    emit_launcher_badge(tray, count);
-
-    const gboolean needs_attention = (count > 0);
-    if (tray->needs_attention == needs_attention)
-        return;
-
-    tray->needs_attention = needs_attention;
+    tray->needs_attention = !!unread;
 
     g_dbus_connection_emit_signal(tray->bus, NULL, SNI_ITEM_PATH,
                                   "org.kde.StatusNotifierItem", "NewStatus",
                                   g_variant_new("(s)",
-                                                needs_attention ? "NeedsAttention" : "Active"),
+                                                unread ? "NeedsAttention" : "Active"),
                                   NULL);
     /* NewStatus alone leaves some hosts drawing the old pixmap. */
     g_dbus_connection_emit_signal(tray->bus, NULL, SNI_ITEM_PATH,
                                   "org.kde.StatusNotifierItem", "NewIcon", NULL, NULL);
-    g_message("tray: %d unread", count);
+    g_message("tray: %s", unread ? "unread" : "all read");
 }
 
 void
@@ -455,7 +416,6 @@ wa_tray_free(WaTray *tray)
     g_free(tray->icon_name);
     g_free(tray->attention_icon);
     g_free(tray->desktop_id);
-    g_free(tray->launcher_path);
     g_free(tray->title);
     g_free(tray);
 }

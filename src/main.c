@@ -67,7 +67,6 @@ typedef struct {
     WaTray         *tray;
     char           *config_path;
     GFileMonitor   *debug_monitor;
-    int             unread;
     int             unread_chats;
     guint32         notify_id;
     gboolean        notify_subscribed;
@@ -233,24 +232,53 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
      *   Emoji families, or any emoji WhatsApp draws as text rather than as a
      *   sprite lands on a face with no glyph for it and renders as a blank box.
      *
-     *   A named Arabic face. The desktop font here is PoetsenOne, which carries
-     *   no Arabic at all, so every Arabic run was resolved by fontconfig one
-     *   substitution at a time. Pinning the range to a single face keeps the
-     *   metrics stable across a message that mixes Arabic, Latin and emoji.
+     *   Arabic, which the desktop font here (PoetsenOne) does not carry a single
+     *   glyph of. Naming a face is a courtesy rather than a control: WebKitGTK
+     *   resolves a character its first family lacks through fontconfig and never
+     *   looks at the rest of the list, which was measured by asking for Naskh and
+     *   for Kufi and getting Noto Sans Arabic both times.
      *
-     *   No line-height. Forcing one here was a mistake worth recording: WhatsApp
-     *   already sets 1.47em on the composer, and overriding it with 1.5 made the
-     *   content one pixel taller than the box it sits in. A box with one pixel of
-     *   overflow is a scrollable box, so every keystroke scrolled the caret back
-     *   into view and the text twitched up and down -- which is exactly the
-     *   symptom the override was added to fix. Measured: scrollHeight exceeded
-     *   clientHeight by 1px on a three-line message, and by zero without it. */
+     *   No line-height on the composer. Forcing one there was a mistake worth
+     *   recording: WhatsApp already sets 1.47em on it, and overriding that with
+     *   1.5 made the content one pixel taller than the box it sits in. A box with
+     *   one pixel of overflow is a scrollable box, so every keystroke scrolled the
+     *   caret back into view and the text twitched up and down -- which is exactly
+     *   the symptom the override was added to fix. Measured: scrollHeight exceeded
+     *   clientHeight by 1px on a three-line message, and zero without it. That is
+     *   why the rule below stops at [contenteditable].
+     *
+     * The rules after the font stack are about Arabic, and about a line box
+     * being too short rather than a font being wrong. WhatsApp gives its list and
+     * its bubbles line boxes of about 1.43em and clips them with overflow:hidden.
+     * The face WebKit falls back to for Arabic reserves 1.37em above the
+     * baseline on its own, so the bowl of a final ن or ي -- which hangs well
+     * below it -- was cut off, and the hook at the left end of each bowl was all
+     * that survived. That left a stray comma after every second word: "يعني"
+     * came out as "يعن ،". Nothing about it is the font's doing -- WhatsApp's own
+     * font stack clips identically, and so does every Arabic face installed here
+     * -- and no @font-face descriptor helps, because WebKitGTK ignores both
+     * local() sources and ascent-override. A taller line box is the one thing
+     * that fixes it. Measured on a 14px preview: clipped at 20px, 22px and 23.8px,
+     * clean at 24px, i.e. anything at or above about 1.6em. Text elements are
+     * named one by one rather than styling everything, so the surrounding layout
+     * keeps the heights WhatsApp gave it. */
     char *css = g_strdup_printf(
-        "@font-face { font-family: \"wa-arabic\";"
-        " src: local(\"Noto Sans Arabic\"), local(\"Noto Naskh Arabic\"), local(\"DejaVu Sans\");"
-        " unicode-range: U+0600-06FF, U+0750-077F, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF; }"
-        "* { font-family: \"%s\", \"wa-arabic\", system-ui, \"Noto Color Emoji\", "
-        "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }",
+        "* { font-family: \"%s\", system-ui, \"Noto Sans Arabic\", \"Noto Color Emoji\", "
+        "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
+        /* Chat names, previews and message text -- every place a message is read.
+           The composer is left alone on purpose; see above. */
+        "span[title]:not([contenteditable] *),"
+        "span[title]:not([contenteditable] *) *,"
+        "span[dir]:not([contenteditable] *),"
+        "span[dir]:not([contenteditable] *) * { line-height: 1.7 !important; }"
+        /* The composer clips the same way and cannot be given a taller line box,
+           so it is given a taller clip instead: padding grows the box that
+           overflow:hidden cuts against, and the negative margin hands the space
+           straight back to the layout. The line box is untouched, which is what
+           keeps the caret from twitching. Measured after: scrollHeight equals
+           clientHeight, where a line-height override left it one pixel over. */
+        "[contenteditable=\"true\"]"
+        "{ padding-bottom: 0.35em !important; margin-bottom: -0.35em !important; }",
         family);
     WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
         css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
@@ -705,6 +733,103 @@ on_permission_request(WebKitWebView *view, WebKitPermissionRequest *request, gpo
     return TRUE;
 }
 
+/* ------------------------------------------------------------------- links */
+
+/* Every link in a chat is target="_blank", and WebKit answers that by asking the
+ * application for a second web view. Without a handler the request is simply
+ * dropped, which is why clicking a link did nothing at all -- no new window, no
+ * navigation, no error. There is nothing to open a second view for here: a link
+ * in a message belongs in the browser, the way it does in every other desktop
+ * chat client. */
+static gboolean
+uri_opens_externally(const char *uri)
+{
+    if (!uri || !*uri)
+        return FALSE;
+    /* blob: and data: are how WhatsApp hands over a download, and about:blank is
+     * the placeholder a window.open() starts life as; none of them mean anything
+     * to a browser. */
+    return g_str_has_prefix(uri, "http://")  || g_str_has_prefix(uri, "https://") ||
+           g_str_has_prefix(uri, "mailto:")  || g_str_has_prefix(uri, "tel:")     ||
+           g_str_has_prefix(uri, "callto:");
+}
+
+/* The client itself lives on web.whatsapp.com and loads from whatsapp.net, so
+ * those stay inside; anything else a click leads to is the web at large. */
+static gboolean
+uri_is_the_client(const char *uri)
+{
+    GUri *parsed = uri ? g_uri_parse(uri, G_URI_FLAGS_NONE, NULL) : NULL;
+    if (!parsed)
+        return FALSE;
+
+    const char *host = g_uri_get_host(parsed);
+    const gboolean ours = host && (g_str_has_suffix(host, "whatsapp.com") ||
+                                   g_str_has_suffix(host, "whatsapp.net"));
+    g_uri_unref(parsed);
+    return ours;
+}
+
+static void
+open_in_browser(const char *uri)
+{
+    if (!uri_opens_externally(uri)) {
+        g_message("not opening %s outside the app", uri ? uri : "(null)");
+        return;
+    }
+
+    GError *error = NULL;
+    if (g_app_info_launch_default_for_uri(uri, NULL, &error))
+        g_message("opened %s in the browser", uri);
+    else {
+        g_message("could not open %s: %s", uri, error ? error->message : "unknown");
+        g_clear_error(&error);
+    }
+}
+
+/* window.open() from the page, and any <a target="_blank"> WebKit turns into
+ * one. Returning NULL declines the new view; the URI has already been handed to
+ * the browser by then. */
+static GtkWidget *
+on_create_web_view(WebKitWebView *view, WebKitNavigationAction *action, gpointer user_data)
+{
+    WebKitURIRequest *request = webkit_navigation_action_get_request(action);
+    open_in_browser(request ? webkit_uri_request_get_uri(request) : NULL);
+    return NULL;
+}
+
+/* The same click can also arrive as a policy decision rather than as a request
+ * for a view, and a plain link with no target would otherwise navigate the
+ * client itself away from WhatsApp -- leaving the user with a web page and no
+ * way back. Both are sent to the browser instead. */
+static gboolean
+on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision,
+                 WebKitPolicyDecisionType type, gpointer user_data)
+{
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION &&
+        type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION)
+        return FALSE;
+
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    WebKitURIRequest *request = webkit_navigation_action_get_request(action);
+    const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
+
+    if (!uri_opens_externally(uri))
+        return FALSE;
+
+    /* A navigation the page made on its own -- a redirect through a login step,
+     * say -- is the client going about its business, and only a click is a
+     * request to leave. */
+    if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION &&
+        (uri_is_the_client(uri) || !webkit_navigation_action_is_user_gesture(action)))
+        return FALSE;
+
+    open_in_browser(uri);
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
 static gboolean
 on_decide_destination(WebKitDownload *download, gchar *suggested_filename, gpointer user_data)
 {
@@ -801,31 +926,6 @@ typedef struct {
     WaApp *app;
     int    count;
 } UnreadNotice;
-
-/* The badge shows messages, the way the phone and the in-app pills do. The page
- * returns "<messages> <chats>"; a page that has not finished drawing the list
- * yet returns nothing, and then the chat count stands in rather than showing a
- * badge that is plainly wrong. */
-static void
-on_unread_counted(GObject *source, GAsyncResult *result, gpointer user_data)
-{
-    WaApp *self = user_data;
-    JSCValue *value = webkit_web_view_evaluate_javascript_finish(
-        WEBKIT_WEB_VIEW(source), result, NULL);
-    if (!value)
-        return;
-
-    char *text = jsc_value_to_string(value);
-    int messages = 0, chats = 0;
-    if (text)
-        sscanf(text, "%d %d", &messages, &chats);
-
-    self->unread = messages > 0 ? messages : self->unread_chats;
-    wa_tray_set_unread(self->tray, self->unread);
-
-    g_free(text);
-    g_object_unref(value);
-}
 
 /* The page hands over the contact's picture as raw bytes; a GNotification icon
  * has to be a file, so it is written to the runtime directory under one reusable
@@ -978,6 +1078,7 @@ send_desktop_notification(WaApp *self, const char *summary, const char *body,
     if (image)
         g_variant_builder_add(&hints, "{sv}", "image-path", g_variant_new_string(image));
 
+    g_message("notification: %s -- %s", summary ? summary : "", body ? body : "");
     g_dbus_connection_call(
         bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
         "org.freedesktop.Notifications", "Notify",
@@ -989,6 +1090,10 @@ send_desktop_notification(WaApp *self, const char *summary, const char *body,
     return TRUE;
 }
 
+/* "open" is the page saying the message landed in the conversation already on
+ * screen. Nothing is raised for that: the user is reading it as it arrives, and
+ * WhatsApp plays its own tone, which is the whole of what a notification would
+ * add. Banners are for the chats the user is not looking at. */
 static void
 on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
 {
@@ -997,9 +1102,13 @@ on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
         WEBKIT_WEB_VIEW(source), result, NULL);
 
     char *chat = NULL, *sender = NULL, *message = NULL, *avatar = NULL, **parts = NULL;
+    gboolean on_screen = FALSE;
+
     if (value) {
         char *payload = jsc_value_to_string(value);
-        if (payload && *payload && !g_str_equal(payload, "undefined")) {
+        if (payload && g_str_equal(payload, "open")) {
+            on_screen = TRUE;
+        } else if (payload && *payload && !g_str_equal(payload, "undefined")) {
             parts = g_strsplit(payload, "\x1f", 4);
             chat    = (parts[0] && *parts[0]) ? parts[0] : NULL;
             sender  = (chat && parts[1] && *parts[1]) ? parts[1] : NULL;
@@ -1010,7 +1119,10 @@ on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
         g_object_unref(value);
     }
 
-    notify_unread(notice->app, notice->count, chat, sender, message, avatar);
+    if (on_screen)
+        g_message("notification skipped: the message is in the chat on screen");
+    else
+        notify_unread(notice->app, notice->count, chat, sender, message, avatar);
 
     g_strfreev(parts);
     g_free(notice);
@@ -1036,8 +1148,7 @@ describe_then_notify(gpointer user_data)
 
 /* WhatsApp Web puts "(3) WhatsApp" in the document title while chats are unread
  * and drops the prefix once they are read. That is the only unread signal the
- * page hands us without scraping its DOM, and it drives both the tray icon and
- * the dock badge. */
+ * page hands us without scraping its DOM, and it is what marks the tray icon. */
 static void
 on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
@@ -1046,8 +1157,8 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 
     /* The parenthesised number counts unread CHATS, not messages: two
      * conversations holding five messages between them read "(2) WhatsApp". It
-     * is a reliable signal that something changed, and a poor badge -- so it
-     * only triggers the look, and the real figure is counted in the page. */
+     * is read for one thing only -- has anything new arrived -- because that is
+     * all it is reliable for. No number is shown anywhere. */
     int chats = 0;
     if (title && title[0] == '(')
         chats = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
@@ -1060,15 +1171,7 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
     }
     self->unread_chats = chats;
 
-    if (chats == 0) {
-        self->unread = 0;
-        wa_tray_set_unread(self->tray, 0);
-    } else {
-        webkit_web_view_evaluate_javascript(
-            self->view,
-            "window.__whatsappUnreadCount ? window.__whatsappUnreadCount() : '';",
-            -1, NULL, NULL, NULL, on_unread_counted, self);
-    }
+    wa_tray_set_attention(self->tray, chats > 0);
 
     if (self->window)
         gtk_window_set_title(self->window, (title && *title) ? title : WA_TITLE);
@@ -1207,6 +1310,8 @@ build_window(WaApp *self)
     allow_notifications(self->view);
     g_signal_connect(self->view, "notify::title",
                      G_CALLBACK(on_title_changed), self);
+    g_signal_connect(self->view, "create", G_CALLBACK(on_create_web_view), self);
+    g_signal_connect(self->view, "decide-policy", G_CALLBACK(on_decide_policy), self);
     g_signal_connect(self->view, "load-changed", G_CALLBACK(on_load_changed), self);
     webkit_web_view_set_zoom_level(self->view, zoom);
 

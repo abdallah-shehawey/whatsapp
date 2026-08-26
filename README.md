@@ -34,8 +34,12 @@ document as unfocused so they arrive either way, and deliberately leaves
 
 - Starts hidden at login and lives in the tray; the page still loads and
   notifications still arrive with no window on screen
-- Tray icon switches to an unread badge, driven by WhatsApp's own `(3) WhatsApp`
-  document title
+- Tray icon marks itself unread, driven by WhatsApp's own `(3) WhatsApp`
+  document title. No number is drawn anywhere
+- A notification for a message that lands in the chat already on screen is
+  skipped -- the user is reading it as it arrives, and WhatsApp plays its own
+  tone for it
+- Links open in the desktop's browser rather than inside the client
 - Follows the desktop's dark/light preference and interface font
 - Downloads land in `~/Downloads`
 - WebKit's in-process memory pressure handler is switched on, so it sheds caches

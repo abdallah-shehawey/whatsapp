@@ -16,10 +16,10 @@ WaTray *wa_tray_new(const char *icon_name,
                     const WaTrayCallbacks *callbacks,
                     gpointer user_data);
 
-/* Publishes the unread count two ways: the tray item goes to NeedsAttention so
- * the host swaps in the attention icon, and a Unity LauncherEntry signal puts a
- * numbered badge on the dock icon. Cheap to call repeatedly -- an unchanged
- * count does nothing. */
-void wa_tray_set_unread(WaTray *tray, int count);
+/* Marks the tray item NeedsAttention so the host swaps in the attention icon.
+ * No number is published anywhere: the app used to put the unread count on the
+ * dock icon over com.canonical.Unity.LauncherEntry, and the badge was more
+ * noise than news. Cheap to call repeatedly -- an unchanged state does nothing. */
+void wa_tray_set_attention(WaTray *tray, gboolean unread);
 
 void wa_tray_free(WaTray *tray);
