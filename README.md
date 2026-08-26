@@ -47,12 +47,19 @@ document as unfocused so they arrive either way, and deliberately leaves
 
 ## Install
 
-From the [shinux repository](https://shehawey.github.io/shinux):
+From the [shinux repository](https://abdallah-shehawey.github.io/shinux/), which
+carries signed builds for both families:
 
 ```sh
 sudo dnf install whatsapp     # Fedora and friends
 sudo apt install whatsapp     # Debian, Ubuntu 24.04+
 ```
+
+The package installs a system-wide autostart entry, so it starts hidden in the
+tray at login without writing into a home directory. Do not add `make autostart`
+on top of it: login would then run `whatsapp --hidden` twice. The second launch
+exits instead of raising the first one's window, but the per-user entry is
+redundant.
 
 ## Build
 
@@ -88,8 +95,39 @@ make no-autostart   # undo just the autostart part
 | `src/inject.js` | page-side helpers, compiled into the binary |
 | `tools/make-icons.py` | regenerates `data/icons` — `make icons`, never hand-edit the PNGs |
 
-State lives in `~/.local/share/whatsapp`, config in `~/.config/whatsapp`. The
-config file takes `[view] font` and `[window] width`/`height`.
+State lives in `~/.local/share/whatsapp`, config in `~/.config/whatsapp`.
+
+## Configuration
+
+`~/.config/whatsapp/whatsapp.conf`, every key optional:
+
+| Key | Default | What it does |
+|---|---|---|
+| `[view] font` | the GNOME interface font | family for the interface |
+| `[view] chat-font` | `"Noto Sans", "Noto Sans Arabic", system-ui` | family for message text, the composer and the chat list |
+| `[view] font-size` | `16` | root font size in pixels — WhatsApp sizes in rem, so this scales the client |
+| `[view] zoom` | `1.0` | WebKit zoom level, also set with `Ctrl` `+`/`-` |
+| `[window] width`, `[window] height` | `1200x800` | remembered on exit |
+
+The interface font and the reading font are separate deliberately. A display face
+is a fine choice for a desktop and a poor one for a chat: if it carries no
+Arabic — and many do not — an Arabic message is drawn in a fallback while the
+digits and punctuation in the same sentence stay in the display face, which is
+one sentence in two unrelated typefaces.
+
+## Diagnosing it
+
+```sh
+WHATSAPP_DEBUG_EVAL=/tmp/eval.js whatsapp
+```
+
+Whatever lands in that file is evaluated in the live page and the result logged;
+writing `#snapshot` into it instead writes a PNG of the window to
+`/tmp/whatsapp-snapshot.png`. Both exist because every question worth asking is
+about a signed-in session: WebKitGTK 2.52's remote inspector does not answer on
+its HTTP port, and a GNOME Wayland session will not hand a screenshot to a
+process like this one. Unset by default, and deliberately so — it is a way into
+a live WhatsApp session, not a feature.
 
 ## Licence
 
