@@ -26,9 +26,17 @@ and the quirk beats whatever the application sets — so setting a Chrome user
 agent is not enough on its own, `enable-site-specific-quirks` has to go off too.
 
 **Notifications went missing while the window was open.** WhatsApp Web
-suppresses them when it believes the window is focused. whatsapp reports the
-document as unfocused so they arrive either way, and deliberately leaves
-`visibilityState` alone so read receipts and sync keep behaving.
+suppresses them when it believes the window is focused, so the client raises its
+own — one per message, driven by a watch on the chat list rather than by the
+document title. The title only counts unread *chats*: a second and a third
+message from the same person leave `(1) WhatsApp` exactly as it was, and every
+one of them used to arrive in silence behind the first one's banner.
+
+The page is told the truth about focus, pushed in from GTK, because WebKit gets
+it wrong: a view in a window hidden in the tray still reports itself focused.
+Pinning the answer to `false` was tried and is a trap — it does produce
+notifications, and it also convinces WhatsApp nobody is looking, so chats the
+user reads never get their receipts.
 
 ## What it does
 
@@ -36,6 +44,9 @@ document as unfocused so they arrive either way, and deliberately leaves
   notifications still arrive with no window on screen
 - Tray icon marks itself unread, driven by WhatsApp's own `(3) WhatsApp`
   document title. No number is drawn anywhere
+- One notification per message, with the sender, the text and the sender's
+  picture on it. Messages sent from the phone raise nothing, and neither does the
+  `typing...` the other side leaves in the chat list while writing
 - A notification for a message that lands in the chat already on screen is
   skipped -- the user is reading it as it arrives, and WhatsApp plays its own
   tone for it
@@ -112,11 +123,19 @@ State lives in `~/.local/share/whatsapp`, config in `~/.config/whatsapp`.
 | `[view] zoom` | `1.0` | WebKit zoom level, also set with `Ctrl` `+`/`-` |
 | `[window] width`, `[window] height` | `1200x800` | remembered on exit |
 
-The interface font and the reading font are separate deliberately. A display face
-is a fine choice for a desktop and a poor one for a chat: if it carries no
-Arabic — and many do not — an Arabic message is drawn in a fallback while the
-digits and punctuation in the same sentence stay in the display face, which is
-one sentence in two unrelated typefaces.
+One family draws everything, chat text included. A separate reading face was
+tried on the theory that a display font is a poor choice for a chat, and it was
+the wrong target: a browser set to ignore page fonts draws bubbles, previews and
+controls alike in the one family, and matching the browser is the point.
+
+WhatsApp's own line boxes are left exactly as they are. A display face carrying
+no Arabic sends Arabic to a fallback whose descenders reach further than the
+0.31em WhatsApp leaves under the baseline, so the tails of ج ح خ and of a final ي
+were shaved off — "يعني" could read as "يعن ،". The client answers that with a
+taller *clip*, not a taller line: padding grows the box `overflow: hidden` cuts
+against and a negative margin hands the space straight back, so every row keeps
+the height WhatsApp Web gives it. Raising `line-height` instead fixes the tails
+and moves every Arabic line off the rhythm the page was designed on.
 
 ## Diagnosing it
 

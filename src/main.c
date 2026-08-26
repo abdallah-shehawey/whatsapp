@@ -30,7 +30,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.0"
+#define WA_VERSION    "1.0.4"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -60,6 +60,19 @@
 #define WA_DEFAULT_WIDTH   1200
 #define WA_DEFAULT_HEIGHT   800
 
+/* How many banner ids to remember for the click-to-open handler. */
+#define WA_RECENT_NOTIFICATIONS 8
+/* A repeat of the same summary and body inside this window is the second report
+ * of one message, not a second message. */
+#define WA_NOTIFY_DEDUPE_US  (1500 * 1000)
+/* The document title is only consulted for a message the chat list missed, so it
+ * waits this long for the watcher to speak first. */
+#define WA_TITLE_FALLBACK_US (2500 * 1000)
+/* Chats that were already unread when the client started are not news. WhatsApp
+ * takes several seconds to sync them, and the title climbs from nothing to the
+ * standing count as it does, which read as arrival after arrival. */
+#define WA_STARTUP_GRACE_US  (12000 * 1000)
+
 typedef struct {
     GtkApplication *app;
     GtkWindow      *window;
@@ -69,7 +82,20 @@ typedef struct {
     GFileMonitor   *debug_monitor;
     int             unread_chats;
     guint32         notify_id;
+    /* Every banner gets an id of its own so each message alerts afresh; the
+     * click handler has to recognise the ones still on screen, hence a ring
+     * rather than a single value. */
+    guint32         recent_ids[WA_RECENT_NOTIFICATIONS];
+    int             recent_next;
     gboolean        notify_subscribed;
+    /* What was last announced, and when. The chat list and the document title
+     * can both report the same message, and this is what keeps that from
+     * showing up as two banners. */
+    char           *last_summary;
+    char           *last_body;
+    gint64          last_notify_at;
+    gint64          last_arrival_at;
+    gint64          loaded_at;
     gboolean        start_hidden;
 } WaApp;
 
@@ -238,45 +264,53 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
      *   looks at the rest of the list, which was measured by asking for Naskh and
      *   for Kufi and getting Noto Sans Arabic both times.
      *
-     *   No line-height on the composer. Forcing one there was a mistake worth
-     *   recording: WhatsApp already sets 1.47em on it, and overriding that with
-     *   1.5 made the content one pixel taller than the box it sits in. A box with
-     *   one pixel of overflow is a scrollable box, so every keystroke scrolled the
-     *   caret back into view and the text twitched up and down -- which is exactly
-     *   the symptom the override was added to fix. Measured: scrollHeight exceeded
-     *   clientHeight by 1px on a three-line message, and zero without it. That is
-     *   why the rule below stops at [contenteditable].
+     *   No line-height anywhere. WhatsApp's own line boxes are left exactly as
+     *   they are; see the note below for what changing them cost.
      *
-     * The rules after the font stack are about Arabic, and about a line box
-     * being too short rather than a font being wrong. WhatsApp gives its list and
-     * its bubbles line boxes of about 1.43em and clips them with overflow:hidden.
-     * The face WebKit falls back to for Arabic reserves 1.37em above the
-     * baseline on its own, so the bowl of a final ن or ي -- which hangs well
-     * below it -- was cut off, and the hook at the left end of each bowl was all
-     * that survived. That left a stray comma after every second word: "يعني"
-     * came out as "يعن ،". Nothing about it is the font's doing -- WhatsApp's own
-     * font stack clips identically, and so does every Arabic face installed here
-     * -- and no @font-face descriptor helps, because WebKitGTK ignores both
-     * local() sources and ascent-override. A taller line box is the one thing
-     * that fixes it. Measured on a 14px preview: clipped at 20px, 22px and 23.8px,
-     * clean at 24px, i.e. anything at or above about 1.6em. Text elements are
-     * named one by one rather than styling everything, so the surrounding layout
-     * keeps the heights WhatsApp gave it. */
+     * The rules after the font stack are about Arabic, and about a clip being too
+     * tight rather than a font being wrong. WhatsApp gives its list and its
+     * bubbles line boxes of about 1.43em and cuts them off with overflow:hidden,
+     * which leaves 0.31em under the baseline; the bowls of ج ح خ reach 0.39em
+     * (measured through canvas ink extents at 100px), so their tails were shaved
+     * and "يعني" could read as "يعن ،". No @font-face descriptor helps, because
+     * WebKitGTK ignores local() sources and ascent-override alike.
+     *
+     * The fix is a taller clip, never a taller line: padding grows the box that
+     * overflow:hidden cuts against, and the negative margin hands the space
+     * straight back to the layout, so every row and every bubble keeps the exact
+     * height WhatsApp Web gives it. A line-height override was tried first and is
+     * the reason this note is long. It cured the clipping and broke the rhythm:
+     * a 1.7 line box against a 1.2 content box moves the baseline down by the
+     * half-leading, and since the strut comes from the Latin display font while
+     * the glyphs come from the Arabic fallback, Arabic and Latin in the same
+     * list settled at visibly different heights -- text "going up and down",
+     * which is not what the same page does in a browser. On the composer the
+     * same override cost a pixel of overflow, and a box with one pixel of
+     * overflow is a scrollable box, so every keystroke scrolled the caret back
+     * into view and the text twitched. Measured after this rule: scrollHeight
+     * equals clientHeight. */
     char *css = g_strdup_printf(
         "* { font-family: \"%s\", system-ui, \"Noto Sans Arabic\", \"Noto Color Emoji\", "
         "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
-        /* Chat names, previews and message text -- every place a message is read.
-           The composer is left alone on purpose; see above. */
-        "span[title]:not([contenteditable] *),"
-        "span[title]:not([contenteditable] *) *,"
-        "span[dir]:not([contenteditable] *),"
-        "span[dir]:not([contenteditable] *) * { line-height: 1.7 !important; }"
-        /* The composer clips the same way and cannot be given a taller line box,
-           so it is given a taller clip instead: padding grows the box that
-           overflow:hidden cuts against, and the negative margin hands the space
-           straight back to the layout. The line box is untouched, which is what
-           keeps the caret from twitching. Measured after: scrollHeight equals
-           clientHeight, where a line-height override left it one pixel over. */
+        /* The padding has to land on the box that actually clips, which is the
+           element AROUND the text rather than the text itself: WhatsApp gives
+           chat names and previews a span of their own and hangs overflow:hidden
+           on its parent, so padding on the span grew a box nothing was cut
+           against and the tails stayed shorn. :has() is what names that parent
+           without depending on WhatsApp's class names, which are obfuscated and
+           rotate every build; WebKitGTK 2.52 supports it (overflow-clip-margin,
+           which is what this would otherwise be a workaround for, it does not).
+
+           There are two boxes to clear, not one, which is why the first attempt
+           changed nothing at all: a preview is div > span[title] > span, and
+           both the div and the inner span carry overflow:hidden against a box
+           the height of one line. Every one of them is named. Measured live: the
+           boxes grow from 20px to 24.9px and the row they sit in stays 76px,
+           because the list fixes its own row heights. */
+        "div:has(> span[title]):not([contenteditable] *),"
+        "span[title] > span:not([contenteditable] *),"
+        /* The composer clips against itself and cannot be given a taller line
+           box either; it is the case this shape was found on. */
         "[contenteditable=\"true\"]"
         "{ padding-bottom: 0.35em !important; margin-bottom: -0.35em !important; }",
         family);
@@ -550,8 +584,12 @@ on_window_state_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 static void
 on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer user_data)
 {
-    if (event == WEBKIT_LOAD_FINISHED)
-        push_focus_state(user_data);
+    WaApp *self = user_data;
+
+    if (event == WEBKIT_LOAD_FINISHED) {
+        self->loaded_at = g_get_monotonic_time();
+        push_focus_state(self);
+    }
 }
 
 /* ------------------------------------------------------------------- debug */
@@ -927,13 +965,19 @@ typedef struct {
     int    count;
 } UnreadNotice;
 
-/* The page hands over the contact's picture as raw bytes; a GNotification icon
- * has to be a file, so it is written to the runtime directory under one reusable
- * name. One file, overwritten per notification, cleaned up by the system on
- * logout -- no growth on disk. */
+/* The page hands over the contact's picture as raw bytes; a notification icon has
+ * to be a file, so it is written to the runtime directory.
+ *
+ * One name is not enough, which took two banners in the same millisecond to show:
+ * both wrote that single file before either was drawn, and the second sender's
+ * message went out under the first sender's face. The name rotates through as
+ * many slots as there are remembered banners, so a picture stays put for as long
+ * as the banner using it can still be on screen. They are small, there are eight,
+ * and the runtime directory is cleared at logout. */
 static char *
 avatar_path(const char *base64)
 {
+    static int slot = 0;
     gsize length = 0;
     guchar *bytes = g_base64_decode(base64, &length);
     if (!bytes || length == 0) {
@@ -941,7 +985,10 @@ avatar_path(const char *base64)
         return NULL;
     }
 
-    char *path = g_build_filename(g_get_user_runtime_dir(), "whatsapp-notify-avatar", NULL);
+    char *name = g_strdup_printf("whatsapp-notify-avatar-%d", slot);
+    slot = (slot + 1) % WA_RECENT_NOTIFICATIONS;
+    char *path = g_build_filename(g_get_user_runtime_dir(), name, NULL);
+    g_free(name);
     gboolean written = g_file_set_contents(path, (const char *)bytes, length, NULL);
 
     g_free(bytes);
@@ -965,8 +1012,11 @@ on_notification_action(GDBusConnection *bus, const char *sender, const char *pat
     const char *action = NULL;
 
     g_variant_get(params, "(u&s)", &id, &action);
-    if (id == self->notify_id)
-        show_window(self);
+    for (int i = 0; i < WA_RECENT_NOTIFICATIONS; i++)
+        if (id != 0 && id == self->recent_ids[i]) {
+            show_window(self);
+            return;
+        }
 }
 
 static void
@@ -977,12 +1027,38 @@ on_notify_sent(GObject *source, GAsyncResult *result, gpointer user_data)
 
     if (reply) {
         g_variant_get(reply, "(u)", &self->notify_id);
+        self->recent_ids[self->recent_next] = self->notify_id;
+        self->recent_next = (self->recent_next + 1) % WA_RECENT_NOTIFICATIONS;
         g_variant_unref(reply);
     }
 }
 
 static gboolean send_desktop_notification(WaApp *self, const char *summary,
                                           const char *body, const char *image);
+
+/* The same message can reach this point twice: the chat list watcher reports
+ * every arrival, and the document title reports the first one in a chat that the
+ * watcher could not see because its row had not been rendered yet. Rather than
+ * order the two, the pair that would be printed on the banner is compared -- two
+ * different messages a second apart still get a banner each, which is the whole
+ * point of the change, while one message reported twice gets one. */
+static gboolean
+notification_is_repeat(WaApp *self, const char *summary, const char *body)
+{
+    const gint64 now = g_get_monotonic_time();
+    const gboolean same = g_strcmp0(self->last_summary, summary) == 0 &&
+                          g_strcmp0(self->last_body, body) == 0;
+
+    if (same && now - self->last_notify_at < WA_NOTIFY_DEDUPE_US)
+        return TRUE;
+
+    g_free(self->last_summary);
+    g_free(self->last_body);
+    self->last_summary  = g_strdup(summary);
+    self->last_body     = g_strdup(body);
+    self->last_notify_at = now;
+    return FALSE;
+}
 
 static void
 notify_unread(WaApp *self, int count, const char *chat, const char *sender,
@@ -999,6 +1075,13 @@ notify_unread(WaApp *self, int count, const char *chat, const char *sender,
         line = g_strdup("You have a new message");
     else
         line = g_strdup_printf("You have %d unread chats", count);
+
+    if (notification_is_repeat(self, chat ? chat : WA_TITLE, line)) {
+        g_message("notification skipped: the same message was just announced");
+        g_free(line);
+        g_free(image);
+        return;
+    }
 
     if (send_desktop_notification(self, chat ? chat : WA_TITLE, line, image)) {
         g_free(line);
@@ -1047,8 +1130,11 @@ notify_unread(WaApp *self, int count, const char *chat, const char *sender,
  *   WhatsApp Web used to play for itself back when the page was told it was
  *   permanently unfocused. The daemon here advertises the "sound" capability.
  *
- * The reused id means a burst of messages replaces one banner instead of
- * stacking a dozen. */
+ * Each message is announced under a new id. Replacing the previous banner was
+ * quieter, and quiet was the bug: the shell neither re-alerts nor rings for a
+ * replacement, so the second and third message of a burst arrived in silence
+ * behind the first one's banner. Nothing piles up in the tray regardless -- that
+ * is what the transient hint above is for. */
 static gboolean
 send_desktop_notification(WaApp *self, const char *summary, const char *body,
                           const char *image)
@@ -1082,7 +1168,7 @@ send_desktop_notification(WaApp *self, const char *summary, const char *body,
     g_dbus_connection_call(
         bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
         "org.freedesktop.Notifications", "Notify",
-        g_variant_new("(susssasa{sv}i)", WA_TITLE, self->notify_id,
+        g_variant_new("(susssasa{sv}i)", WA_TITLE, 0,
                       image ? image : WA_ICON_NAME, summary, body,
                       &actions, &hints, -1),
         G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL,
@@ -1146,6 +1232,35 @@ describe_then_notify(gpointer user_data)
     return G_SOURCE_REMOVE;
 }
 
+/* The chat list watcher nudges us here for every message it sees land, which is
+ * what makes a banner per message possible at all. The document title cannot do
+ * that job: its number counts unread CHATS, so the second and third message from
+ * one person leave "(1) WhatsApp" exactly as it was and nothing fired.
+ *
+ * Only while the window is in front, as before -- WhatsApp Web raises its own
+ * notifications when it believes it is not, and two banners for one message is
+ * worse than the bug this fixes. */
+static void
+on_page_event(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
+{
+    WaApp *self = user_data;
+    char *text = jsc_value_to_string(value);
+
+    const gint64 now = g_get_monotonic_time();
+    if (g_strcmp0(text, "arrival") == 0 && self->window &&
+        gtk_widget_get_visible(GTK_WIDGET(self->window)) &&
+        gtk_window_is_active(self->window) &&
+        now - self->loaded_at > WA_STARTUP_GRACE_US) {
+        self->last_arrival_at = now;
+
+        UnreadNotice *notice = g_new0(UnreadNotice, 1);
+        notice->app = self;
+        notice->count = self->unread_chats > 0 ? self->unread_chats : 1;
+        g_timeout_add(250, describe_then_notify, notice);
+    }
+    g_free(text);
+}
+
 /* WhatsApp Web puts "(3) WhatsApp" in the document title while chats are unread
  * and drops the prefix once they are read. That is the only unread signal the
  * page hands us without scraping its DOM, and it is what marks the tray icon. */
@@ -1163,7 +1278,17 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
     if (title && title[0] == '(')
         chats = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
 
-    if (chats > self->unread_chats && self->window && gtk_window_is_active(self->window)) {
+    /* A backstop for the one case the chat list watcher cannot see: a chat far
+     * enough down the list that its row was never rendered has no previous
+     * preview to have changed, so nothing is reported when a message moves it to
+     * the top. The count rises all the same. Anything the watcher already
+     * announced within the last couple of seconds is left alone. */
+    const gint64 now = g_get_monotonic_time();
+    if (chats > self->unread_chats && self->window &&
+        gtk_widget_get_visible(GTK_WIDGET(self->window)) &&
+        gtk_window_is_active(self->window) &&
+        now - self->last_arrival_at > WA_TITLE_FALLBACK_US &&
+        now - self->loaded_at > WA_STARTUP_GRACE_US) {
         UnreadNotice *notice = g_new0(UnreadNotice, 1);
         notice->app = self;
         notice->count = chats;
@@ -1230,6 +1355,9 @@ build_window(WaApp *self)
     webkit_user_content_manager_register_script_message_handler(content, "whatsappPaste", NULL);
     g_signal_connect(content, "script-message-received::whatsappPaste",
                      G_CALLBACK(on_paste_request), self);
+    webkit_user_content_manager_register_script_message_handler(content, "whatsappEvent", NULL);
+    g_signal_connect(content, "script-message-received::whatsappEvent",
+                     G_CALLBACK(on_page_event), self);
 
     char *font_spec = resolve_font(self);
     apply_font(settings, content, font_spec, resolve_font_size(self));
