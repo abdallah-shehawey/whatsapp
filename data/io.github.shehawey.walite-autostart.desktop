@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WhatsApp
+Comment=Start WhatsApp in the background at login
+Exec=@BINDIR@/wa-lite --hidden
+Icon=io.github.shehawey.walite
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5

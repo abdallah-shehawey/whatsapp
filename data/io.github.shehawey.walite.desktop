@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WhatsApp
+Comment=WhatsApp Web
+Exec=@BINDIR@/wa-lite %u
+Icon=io.github.shehawey.walite
+Terminal=false
+Categories=Network;InstantMessaging;
+Keywords=whatsapp;chat;messaging;
+StartupNotify=true
+StartupWMClass=io.github.shehawey.walite
+SingleMainWindow=true

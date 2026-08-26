@@ -1,0 +1,8 @@
+Icon masters and where they came from:
+
+  app-master.svg   the "whatsapp" icon from the WhiteSur-apps icon theme
+                   (https://github.com/vinceliuice/WhiteSur-icon-theme, GPL-3.0)
+  tray-master.png  the WhatsApp mark the maintainer was already using locally
+
+Everything under the numbered size directories is generated from these two by
+tools/make-icons.py -- run `make icons`, never hand-edit the output.
