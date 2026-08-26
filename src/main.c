@@ -43,10 +43,17 @@
     "Chrome/140.0.0.0 Safari/537.36"
 
 /* Ceiling for WebKit's in-process pressure handler, in MiB. It starts shedding
- * caches at the conservative threshold and gets aggressive at the strict one. */
-#define WA_MEMORY_LIMIT_MB     1600
-#define WA_CONSERVATIVE_FRAC   0.40
-#define WA_STRICT_FRAC         0.70
+ * caches at the conservative threshold and gets aggressive at the strict one.
+ *
+ * Measured, not guessed: a signed-in web process sits at ~1330 MB, so the old
+ * 1600 MB ceiling put the strict threshold (70% = 1120 MB) permanently below the
+ * working set. WebKit then shed caches without pause, and the visible symptom was
+ * emoji sprite sheets being dropped and re-fetched -- "the emoji are broken when
+ * I open WhatsApp". The ceiling has to sit above the working set for the handler
+ * to do what it is for: catching runaway growth, not fighting normal use. */
+#define WA_MEMORY_LIMIT_MB     2560
+#define WA_CONSERVATIVE_FRAC   0.55
+#define WA_STRICT_FRAC         0.85
 #define WA_POLL_INTERVAL_SECS  10.0
 
 #define WA_DEFAULT_WIDTH   1200
@@ -58,8 +65,11 @@ typedef struct {
     WebKitWebView  *view;
     WaTray         *tray;
     char           *config_path;
-    char           *unread_chat;
+    GFileMonitor   *debug_monitor;
     int             unread;
+    int             unread_chats;
+    guint32         notify_id;
+    gboolean        notify_subscribed;
     gboolean        start_hidden;
 } WaApp;
 
@@ -171,32 +181,68 @@ resolve_font(WaApp *self)
                     : g_strdup("Cantarell 11");
 }
 
+/* WhatsApp Web sizes almost everything in rem, so the root font size scales the
+ * entire client -- message text, the composer, chat names. It is deliberately
+ * NOT taken from GNOME's interface font: that font is stated in points for a
+ * desktop widget, and feeding it in here made the root 13px against the 16px
+ * the web assumes, shrinking every message to 81% of its intended size. */
+#define WA_DEFAULT_FONT_PX  16
+
+static int
+resolve_font_size(WaApp *self)
+{
+    GKeyFile *keys = g_key_file_new();
+    int size = 0;
+    if (g_key_file_load_from_file(keys, self->config_path, G_KEY_FILE_NONE, NULL))
+        size = g_key_file_get_integer(keys, "view", "font-size", NULL);
+    g_key_file_free(keys);
+
+    return (size >= 10 && size <= 32) ? size : WA_DEFAULT_FONT_PX;
+}
+
 /* WhatsApp Web names its own font stack in CSS, so setting WebKit's defaults is
  * not enough to change what is actually drawn -- a user-level sheet is. The
  * fallbacks matter: a display face like PoetsenOne carries no Arabic glyphs, and
  * fontconfig only substitutes per-glyph if something further down the list has
  * them. */
 static void
-apply_font(WebKitSettings *settings, WebKitUserContentManager *content, const char *font_spec)
+apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
+           const char *font_spec, int pixels)
 {
     PangoFontDescription *desc = pango_font_description_from_string(font_spec);
     const char *family = pango_font_description_get_family(desc);
-    int points = pango_font_description_get_size(desc) / PANGO_SCALE;
 
     if (!family || !*family)
         family = "sans-serif";
-    if (points <= 0)
-        points = 11;
-
-    /* GNOME states sizes in points; WebKit wants CSS pixels at 96 dpi. */
-    const int pixels = (int)(points * 96.0 / 72.0 + 0.5);
 
     webkit_settings_set_default_font_family(settings, family);
     webkit_settings_set_sans_serif_font_family(settings, family);
     webkit_settings_set_default_font_size(settings, (guint32)pixels);
 
+    /* Three things this sheet has to get right, because it is !important on every
+     * element and so whatever it leaves out is gone from the page:
+     *
+     *   Emoji families, or any emoji WhatsApp draws as text rather than as a
+     *   sprite lands on a face with no glyph for it and renders as a blank box.
+     *
+     *   A named Arabic face. The desktop font here is PoetsenOne, which carries
+     *   no Arabic at all, so every Arabic run was resolved by fontconfig one
+     *   substitution at a time. Pinning the range to a single face keeps the
+     *   metrics stable across a message that mixes Arabic, Latin and emoji.
+     *
+     *   An explicit line-height. This is what fixes the composer jumping while
+     *   Arabic is typed: with the default 'normal', the line box is sized from
+     *   the metrics of whichever font is on the line, so each fallback switch
+     *   resized it and the text moved up and down character by character. */
     char *css = g_strdup_printf(
-        "* { font-family: \"%s\", system-ui, sans-serif !important; }", family);
+        "@font-face { font-family: \"wa-arabic\";"
+        " src: local(\"Noto Sans Arabic\"), local(\"Noto Naskh Arabic\"), local(\"DejaVu Sans\");"
+        " unicode-range: U+0600-06FF, U+0750-077F, U+08A0-08FF, U+FB50-FDFF, U+FE70-FEFF; }"
+        "* { font-family: \"%s\", \"wa-arabic\", system-ui, \"Noto Color Emoji\", "
+        "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
+        "[contenteditable=\"true\"], [contenteditable=\"true\"] *,"
+        "#main .selectable-text, #main .selectable-text * { line-height: 1.5 !important; }",
+        family);
     WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
         css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
     webkit_user_content_manager_add_style_sheet(content, sheet);
@@ -431,6 +477,115 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
     }
 }
 
+/* ------------------------------------------------------------------- focus */
+
+/* WhatsApp Web decides two things from document.hasFocus(): whether to raise a
+ * desktop notification, and whether the chat on screen counts as read. WebKit
+ * answers it from the WebView's own state, which stays "focused" while the
+ * window sits hidden in the tray -- so the page is told what GTK knows instead.
+ *
+ * Note what this is not: an earlier version pinned the page's answer to false to
+ * force notifications through, which also told WhatsApp the user was never
+ * looking and silently killed read receipts. Reporting the real state gives both
+ * -- notifications while the window is away, receipts while it is in front. */
+static void
+push_focus_state(WaApp *self)
+{
+    if (!self->view || !self->window)
+        return;
+
+    const gboolean focused = gtk_widget_get_visible(GTK_WIDGET(self->window)) &&
+                             gtk_window_is_active(self->window);
+    char *js = g_strdup_printf("window.__whatsappSetFocus && window.__whatsappSetFocus(%s);",
+                               focused ? "true" : "false");
+    webkit_web_view_evaluate_javascript(self->view, js, -1, NULL, NULL, NULL, NULL, NULL);
+    g_free(js);
+}
+
+static void
+on_window_state_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
+{
+    push_focus_state(user_data);
+}
+
+/* inject.js starts every page load with no idea where the focus is, so the state
+ * is pushed again as soon as there is a page to receive it. */
+static void
+on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer user_data)
+{
+    if (event == WEBKIT_LOAD_FINISHED)
+        push_focus_state(user_data);
+}
+
+/* ------------------------------------------------------------------- debug */
+
+/* A maintenance channel: JavaScript dropped into the file named by
+ * WHATSAPP_DEBUG_EVAL is run in the live page and its result logged. WebKitGTK
+ * 2.52's remote inspector does not answer on its HTTP port, and questions like
+ * "what does document.hasFocus() return while the window sits in the tray" can
+ * only be answered in a signed-in session, not in a test harness.
+ *
+ * Unset by default, and deliberately so: it is a way into a live WhatsApp
+ * session, not a feature. */
+static void
+on_eval_done(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    GError *error = NULL;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+
+    if (!value) {
+        g_message("[eval] failed: %s", error ? error->message : "unknown");
+        g_clear_error(&error);
+        return;
+    }
+
+    char *text = jsc_value_to_string(value);
+    g_message("[eval] %s", text);
+    g_free(text);
+    g_object_unref(value);
+}
+
+static void
+on_debug_file_changed(GFileMonitor *monitor, GFile *file, GFile *other,
+                      GFileMonitorEvent event, gpointer user_data)
+{
+    WaApp *self = user_data;
+
+    if (event != G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT &&
+        event != G_FILE_MONITOR_EVENT_CREATED)
+        return;
+
+    char *script = NULL;
+    if (!g_file_load_contents(file, NULL, &script, NULL, NULL, NULL))
+        return;
+
+    if (*g_strstrip(script))
+        webkit_web_view_evaluate_javascript(self->view, script, -1, NULL, NULL,
+                                            NULL, on_eval_done, self);
+    g_free(script);
+}
+
+static void
+watch_debug_file(WaApp *self)
+{
+    const char *path = g_getenv("WHATSAPP_DEBUG_EVAL");
+    if (!path)
+        return;
+
+    GFile *file = g_file_new_for_path(path);
+    self->debug_monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL, NULL);
+    g_object_unref(file);
+
+    if (!self->debug_monitor) {
+        g_warning("debug: could not watch %s", path);
+        return;
+    }
+    g_signal_connect(self->debug_monitor, "changed",
+                     G_CALLBACK(on_debug_file_changed), self);
+    g_message("debug: evaluating %s in the page whenever it changes", path);
+}
+
 /* ------------------------------------------------------------- web plumbing */
 
 /* Second route into the paste path. The key controller can miss Ctrl+V -- the
@@ -451,24 +606,46 @@ on_paste_request(WebKitUserContentManager *manager, JSCValue *value, gpointer us
     paste_clipboard_image(self);
 }
 
-/* The page reports which chat is behind the newest unread badge, purely so a
- * notification can name it. */
-static void
-on_unread_chat(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
-{
-    WaApp *self = user_data;
-    char *name = jsc_value_to_string(value);
-
-    g_free(self->unread_chat);
-    self->unread_chat = (name && *name) ? name : (g_free(name), NULL);
-}
-
 static void
 on_script_message(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
 {
     char *text = jsc_value_to_string(value);
     g_message("[page] %s", text);
     g_free(text);
+}
+
+/* WhatsApp puts a "Message notifications are off. Turn on" banner across the top
+ * of the chat list whenever Notification.permission is not already "granted".
+ * WebKitGTK does not persist that grant across restarts, so pressing "Turn on"
+ * worked for exactly one session and the banner was back on the next launch --
+ * every launch, no matter what the in-app settings said. Seeding the origin as
+ * allowed before the first load is what makes the permission true at first paint
+ * rather than after a prompt. */
+static void
+allow_notifications(WebKitWebView *view)
+{
+    WebKitSecurityOrigin *origin = webkit_security_origin_new_for_uri(WA_URL);
+    GList *allowed = g_list_prepend(NULL, origin);
+
+    webkit_web_context_initialize_notification_permissions(
+        webkit_web_view_get_context(view), allowed, NULL);
+
+    g_list_free(allowed);
+    webkit_security_origin_unref(origin);
+}
+
+/* navigator.permissions.query() takes this path rather than the request one, and
+ * an unanswered query leaves WhatsApp believing notifications are unavailable. */
+static gboolean
+on_permission_state_query(WebKitWebView *view, WebKitPermissionStateQuery *query,
+                          gpointer user_data)
+{
+    const char *name = webkit_permission_state_query_get_name(query);
+
+    webkit_permission_state_query_finish(
+        query, g_strcmp0(name, "notifications") == 0 ? WEBKIT_PERMISSION_STATE_GRANTED
+                                                     : WEBKIT_PERMISSION_STATE_PROMPT);
+    return TRUE;
 }
 
 /* Grant only what WhatsApp actually needs: notifications, and the microphone
@@ -529,13 +706,171 @@ configure_memory_pressure(void)
  * itself unfocused was tried first and is a trap: it does produce notifications,
  * and it also convinces WhatsApp the user is not looking, so opening a chat
  * never marks it read. */
+/* GNotification carries no sound, and GNOME only rings for notifications that
+ * come with a sound hint, so the tone is played here. This is the ding that went
+ * missing when the hasFocus override was dropped: WhatsApp Web used to believe
+ * it was permanently unfocused and so played its own tone for every message.
+ * canberra-gtk-play follows the desktop's sound theme; paplay is the fallback
+ * for a system without libcanberra installed. */
 static void
-notify_unread(WaApp *self, int count)
+play_message_sound(void)
 {
-    GNotification *note = g_notification_new(WA_TITLE);
+    GSettings *sound = NULL;
+    GSettingsSchemaSource *source = g_settings_schema_source_get_default();
+    GSettingsSchema *schema = source ? g_settings_schema_source_lookup(
+        source, "org.gnome.desktop.sound", TRUE) : NULL;
 
-    if (self->unread_chat)
-        g_notification_set_body(note, self->unread_chat);
+    if (schema) {
+        sound = g_settings_new("org.gnome.desktop.sound");
+        g_settings_schema_unref(schema);
+    }
+    /* Someone who has switched desktop sounds off means it. */
+    if (sound && !g_settings_get_boolean(sound, "event-sounds")) {
+        g_object_unref(sound);
+        return;
+    }
+    g_clear_object(&sound);
+
+    char *canberra = g_find_program_in_path("canberra-gtk-play");
+    char *argv_canberra[] = { canberra, "-i", "message-new-instant",
+                              "-d", "new WhatsApp message", NULL };
+    char *argv_paplay[]   = { "paplay",
+                              "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga",
+                              NULL };
+    char **argv = canberra ? argv_canberra : argv_paplay;
+
+    GError *error = NULL;
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_SEARCH_PATH | G_SPAWN_STDOUT_TO_DEV_NULL |
+                       G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL, NULL, NULL, &error)) {
+        g_message("no notification sound: %s", error ? error->message : "unknown");
+        g_clear_error(&error);
+    }
+    g_free(canberra);
+}
+
+typedef struct {
+    WaApp *app;
+    int    count;
+} UnreadNotice;
+
+/* The badge shows messages, the way the phone and the in-app pills do. The page
+ * returns "<messages> <chats>"; a page that has not finished drawing the list
+ * yet returns nothing, and then the chat count stands in rather than showing a
+ * badge that is plainly wrong. */
+static void
+on_unread_counted(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    WaApp *self = user_data;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, NULL);
+    if (!value)
+        return;
+
+    char *text = jsc_value_to_string(value);
+    int messages = 0, chats = 0;
+    if (text)
+        sscanf(text, "%d %d", &messages, &chats);
+
+    self->unread = messages > 0 ? messages : self->unread_chats;
+    wa_tray_set_unread(self->tray, self->unread);
+
+    g_free(text);
+    g_object_unref(value);
+}
+
+/* The page hands over the contact's picture as raw bytes; a GNotification icon
+ * has to be a file, so it is written to the runtime directory under one reusable
+ * name. One file, overwritten per notification, cleaned up by the system on
+ * logout -- no growth on disk. */
+static char *
+avatar_path(const char *base64)
+{
+    gsize length = 0;
+    guchar *bytes = g_base64_decode(base64, &length);
+    if (!bytes || length == 0) {
+        g_free(bytes);
+        return NULL;
+    }
+
+    char *path = g_build_filename(g_get_user_runtime_dir(), "whatsapp-notify-avatar", NULL);
+    gboolean written = g_file_set_contents(path, (const char *)bytes, length, NULL);
+
+    g_free(bytes);
+    if (!written) {
+        g_free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static void show_window(WaApp *self);
+
+/* Clicking the banner raises the window. */
+static void
+on_notification_action(GDBusConnection *bus, const char *sender, const char *path,
+                       const char *iface, const char *signal, GVariant *params,
+                       gpointer user_data)
+{
+    WaApp *self = user_data;
+    guint32 id = 0;
+    const char *action = NULL;
+
+    g_variant_get(params, "(u&s)", &id, &action);
+    if (id == self->notify_id)
+        show_window(self);
+}
+
+static void
+on_notify_sent(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    WaApp *self = user_data;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, NULL);
+
+    if (reply) {
+        g_variant_get(reply, "(u)", &self->notify_id);
+        g_variant_unref(reply);
+    }
+}
+
+static gboolean send_desktop_notification(WaApp *self, const char *summary,
+                                          const char *body, const char *image);
+
+static void
+notify_unread(WaApp *self, int count, const char *chat, const char *sender,
+              const char *message, const char *avatar)
+{
+    char *image = avatar ? avatar_path(avatar) : NULL;
+    char *line = NULL;
+
+    if (message && sender)
+        line = g_strdup_printf("%s: %s", sender, message);
+    else if (message)
+        line = g_strdup(message);
+    else if (count == 1)
+        line = g_strdup("You have a new message");
+    else
+        line = g_strdup_printf("You have %d unread chats", count);
+
+    if (send_desktop_notification(self, chat ? chat : WA_TITLE, line, image)) {
+        g_free(line);
+        g_free(image);
+        return;
+    }
+    g_free(line);
+    g_free(image);
+
+    /* Who it is goes in the title and what they said in the body, the way every
+     * other messaging app on the desktop does it. */
+    GNotification *note = g_notification_new(chat ? chat : WA_TITLE);
+
+    if (message && sender) {
+        char *body = g_strdup_printf("%s: %s", sender, message);
+        g_notification_set_body(note, body);
+        g_free(body);
+    } else if (message)
+        g_notification_set_body(note, message);
     else if (count == 1)
         g_notification_set_body(note, "You have a new message");
     else {
@@ -547,13 +882,109 @@ notify_unread(WaApp *self, int count)
     GIcon *icon = g_themed_icon_new(WA_ICON_NAME);
     g_notification_set_icon(note, icon);
     g_notification_set_default_action(note, "app.present");
-
-    /* One reused id, so a burst of messages replaces the banner instead of
-     * stacking a dozen of them. */
     g_application_send_notification(G_APPLICATION(self->app), "unread", note);
+    play_message_sound();
 
     g_object_unref(icon);
     g_object_unref(note);
+}
+
+/* The desktop's own notification interface rather than GNotification, for two
+ * things GNotification cannot express:
+ *
+ *   transient. Without it the shell keeps every banner in the message tray, and
+ *   Dash to Panel adds those pending notifications to the launcher badge on top
+ *   of the unread count -- one message showed up as two.
+ *
+ *   sound-name. GNotification is silent, and the tone this replaces was the one
+ *   WhatsApp Web used to play for itself back when the page was told it was
+ *   permanently unfocused. The daemon here advertises the "sound" capability.
+ *
+ * The reused id means a burst of messages replaces one banner instead of
+ * stacking a dozen. */
+static gboolean
+send_desktop_notification(WaApp *self, const char *summary, const char *body,
+                          const char *image)
+{
+    GDBusConnection *bus = g_application_get_dbus_connection(G_APPLICATION(self->app));
+    if (!bus)
+        return FALSE;
+
+    if (!self->notify_subscribed) {
+        g_dbus_connection_signal_subscribe(
+            bus, "org.freedesktop.Notifications", "org.freedesktop.Notifications",
+            "ActionInvoked", "/org/freedesktop/Notifications", NULL,
+            G_DBUS_SIGNAL_FLAGS_NONE, on_notification_action, self, NULL);
+        self->notify_subscribed = TRUE;
+    }
+
+    GVariantBuilder actions;
+    g_variant_builder_init(&actions, G_VARIANT_TYPE("as"));
+    g_variant_builder_add(&actions, "s", "default");
+    g_variant_builder_add(&actions, "s", "Open");
+
+    GVariantBuilder hints;
+    g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&hints, "{sv}", "transient", g_variant_new_boolean(TRUE));
+    g_variant_builder_add(&hints, "{sv}", "desktop-entry", g_variant_new_string(WA_APP_ID));
+    g_variant_builder_add(&hints, "{sv}", "sound-name", g_variant_new_string("message-new-instant"));
+    if (image)
+        g_variant_builder_add(&hints, "{sv}", "image-path", g_variant_new_string(image));
+
+    g_dbus_connection_call(
+        bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "Notify",
+        g_variant_new("(susssasa{sv}i)", WA_TITLE, self->notify_id,
+                      image ? image : WA_ICON_NAME, summary, body,
+                      &actions, &hints, -1),
+        G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL,
+        on_notify_sent, self);
+    return TRUE;
+}
+
+static void
+on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    UnreadNotice *notice = user_data;
+    JSCValue *value = webkit_web_view_call_async_javascript_function_finish(
+        WEBKIT_WEB_VIEW(source), result, NULL);
+
+    char *chat = NULL, *sender = NULL, *message = NULL, *avatar = NULL, **parts = NULL;
+    if (value) {
+        char *payload = jsc_value_to_string(value);
+        if (payload && *payload && !g_str_equal(payload, "undefined")) {
+            parts = g_strsplit(payload, "\x1f", 4);
+            chat    = (parts[0] && *parts[0]) ? parts[0] : NULL;
+            sender  = (chat && parts[1] && *parts[1]) ? parts[1] : NULL;
+            message = (chat && parts[2] && *parts[2]) ? parts[2] : NULL;
+            avatar  = (chat && parts[3] && *parts[3]) ? parts[3] : NULL;
+        }
+        g_free(payload);
+        g_object_unref(value);
+    }
+
+    notify_unread(notice->app, notice->count, chat, sender, message, avatar);
+
+    g_strfreev(parts);
+    g_free(notice);
+}
+
+/* The page is asked for the description at notification time rather than pushing
+ * it ahead of time. An earlier version had inject.js post it on every title
+ * change and read whatever had last arrived, which raced the title itself: the
+ * count reached the app first and every notification read "You have a new
+ * message" with no sender and no text. The short delay lets WhatsApp finish
+ * moving the chat to the top of the list before the row is read. */
+static gboolean
+describe_then_notify(gpointer user_data)
+{
+    UnreadNotice *notice = user_data;
+
+    webkit_web_view_call_async_javascript_function(
+        notice->app->view,
+        "return window.__whatsappDescribeUnread ? window.__whatsappDescribeUnread() : '';",
+        -1, NULL, NULL, NULL, NULL, on_unread_described, notice);
+    return G_SOURCE_REMOVE;
 }
 
 /* WhatsApp Web puts "(3) WhatsApp" in the document title while chats are unread
@@ -566,17 +997,31 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
     WaApp *self = user_data;
     const char *title = webkit_web_view_get_title(self->view);
 
-    /* Anything non-numeric inside the parentheses -- "(99+)" and the like --
-     * still counts as unread, just without an exact number. */
-    int unread = 0;
+    /* The parenthesised number counts unread CHATS, not messages: two
+     * conversations holding five messages between them read "(2) WhatsApp". It
+     * is a reliable signal that something changed, and a poor badge -- so it
+     * only triggers the look, and the real figure is counted in the page. */
+    int chats = 0;
     if (title && title[0] == '(')
-        unread = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
+        chats = atoi(title + 1) > 0 ? atoi(title + 1) : 1;
 
-    if (unread > self->unread && self->window && gtk_window_is_active(self->window))
-        notify_unread(self, unread);
-    self->unread = unread;
+    if (chats > self->unread_chats && self->window && gtk_window_is_active(self->window)) {
+        UnreadNotice *notice = g_new0(UnreadNotice, 1);
+        notice->app = self;
+        notice->count = chats;
+        g_timeout_add(250, describe_then_notify, notice);
+    }
+    self->unread_chats = chats;
 
-    wa_tray_set_unread(self->tray, unread);
+    if (chats == 0) {
+        self->unread = 0;
+        wa_tray_set_unread(self->tray, 0);
+    } else {
+        webkit_web_view_evaluate_javascript(
+            self->view,
+            "window.__whatsappUnreadCount ? window.__whatsappUnreadCount() : '';",
+            -1, NULL, NULL, NULL, on_unread_counted, self);
+    }
 
     if (self->window)
         gtk_window_set_title(self->window, (title && *title) ? title : WA_TITLE);
@@ -635,12 +1080,9 @@ build_window(WaApp *self)
     webkit_user_content_manager_register_script_message_handler(content, "whatsappPaste", NULL);
     g_signal_connect(content, "script-message-received::whatsappPaste",
                      G_CALLBACK(on_paste_request), self);
-    webkit_user_content_manager_register_script_message_handler(content, "whatsappUnread", NULL);
-    g_signal_connect(content, "script-message-received::whatsappUnread",
-                     G_CALLBACK(on_unread_chat), self);
 
     char *font_spec = resolve_font(self);
-    apply_font(settings, content, font_spec);
+    apply_font(settings, content, font_spec, resolve_font_size(self));
     g_free(font_spec);
 
     WebKitUserScript *script = webkit_user_script_new(
@@ -650,6 +1092,48 @@ build_window(WaApp *self)
         NULL, NULL);
     webkit_user_content_manager_add_script(content, script);
     webkit_user_script_unref(script);
+
+    /* Emoji are sprite sheets, and WhatsApp picks which one to fetch from the
+     * display's resolution: at 1x it serves 40px tiles. Zooming the view does not
+     * change that -- WebKit re-lays-out text at the new size, so text stays sharp,
+     * but a 40px bitmap stretched across 60 device pixels is exactly the softness
+     * in the emoji panel.
+     *
+     * Two things were measured before settling on this. Overriding
+     * devicePixelRatio alone changes nothing: WhatsApp asks
+     * matchMedia('(min-resolution: ...)'), and the 152 generated sprite rules
+     * follow that answer. And GDK_SCALE=2 does nothing under Wayland, where the
+     * compositor owns the scale factor and this display runs at 1.
+     *
+     * So the page is told the resolution it is really being drawn at. Resolution
+     * queries are the only ones answered here; everything else, prefers-color-
+     * scheme included, goes through to WebKit untouched. */
+    if (zoom >= 1.25) {
+        char *hidpi = g_strdup_printf(
+            "(() => {"
+            "  const ratio = %d;"
+            "  Object.defineProperty(window, 'devicePixelRatio',"
+            "    { value: ratio, configurable: true });"
+            "  const real = window.matchMedia.bind(window);"
+            "  window.matchMedia = query => {"
+            "    if (!/min-resolution|min-device-pixel-ratio/.test(query)) return real(query);"
+            "    const m = String(query).match(/([0-9.]+)/);"
+            "    const want = m ? parseFloat(m[1]) : 1;"
+            "    const dppx = /dpi/.test(query) ? want / 96 : want;"
+            "    return { media: query, matches: ratio >= dppx, onchange: null,"
+            "             addEventListener() {}, removeEventListener() {},"
+            "             addListener() {}, removeListener() {},"
+            "             dispatchEvent() { return false; } };"
+            "  };"
+            "})();",
+            2);   /* the sheets come in 1x and 2x; anything above 1.25 wants the 2x */
+        WebKitUserScript *ratio = webkit_user_script_new(
+            hidpi, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+        webkit_user_content_manager_add_script(content, ratio);
+        webkit_user_script_unref(ratio);
+        g_free(hidpi);
+    }
 
     self->view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
                               "network-session",      session,
@@ -671,8 +1155,12 @@ build_window(WaApp *self)
 
     g_signal_connect(self->view, "permission-request",
                      G_CALLBACK(on_permission_request), self);
+    g_signal_connect(self->view, "query-permission-state",
+                     G_CALLBACK(on_permission_state_query), self);
+    allow_notifications(self->view);
     g_signal_connect(self->view, "notify::title",
                      G_CALLBACK(on_title_changed), self);
+    g_signal_connect(self->view, "load-changed", G_CALLBACK(on_load_changed), self);
     webkit_web_view_set_zoom_level(self->view, zoom);
 
     self->window = GTK_WINDOW(gtk_application_window_new(self->app));
@@ -681,11 +1169,17 @@ build_window(WaApp *self)
     gtk_window_set_default_size(self->window, width, height);
     gtk_window_set_child(self->window, GTK_WIDGET(self->view));
     g_signal_connect(self->window, "close-request", G_CALLBACK(on_close_request), self);
+    g_signal_connect(self->window, "notify::is-active",
+                     G_CALLBACK(on_window_state_changed), self);
+    g_signal_connect(self->window, "notify::visible",
+                     G_CALLBACK(on_window_state_changed), self);
 
     GtkEventController *keys = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(on_key_pressed), self);
     gtk_widget_add_controller(GTK_WIDGET(self->window), keys);
+
+    watch_debug_file(self);
 
     webkit_web_view_load_uri(self->view, WA_URL);
 }
@@ -787,6 +1281,5 @@ main(int argc, char **argv)
     wa_tray_free(self.tray);
     g_object_unref(self.app);
     g_free(self.config_path);
-    g_free(self.unread_chat);
     return status;
 }
