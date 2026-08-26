@@ -30,6 +30,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
+#define WA_VERSION    "1.0.0"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -188,6 +189,29 @@ resolve_font(WaApp *self)
  * the web assumes, shrinking every message to 81% of its intended size. */
 #define WA_DEFAULT_FONT_PX  16
 
+/* The interface font and the reading font are deliberately separate. A display
+ * face like PoetsenOne is a fine choice for a desktop, and a poor one for a chat:
+ * it carries no Arabic at all, so an Arabic message was drawn in a fallback while
+ * the digits and punctuation inside the same sentence stayed in the display face
+ * -- one sentence in two unrelated typefaces. Message text, the composer and the
+ * chat list therefore use a family that covers both scripts in one design. */
+#define WA_DEFAULT_CHAT_FONT  "\"Noto Sans\", \"Noto Sans Arabic\", system-ui"
+
+static char *
+resolve_chat_font(WaApp *self)
+{
+    GKeyFile *keys = g_key_file_new();
+    char *font = NULL;
+    if (g_key_file_load_from_file(keys, self->config_path, G_KEY_FILE_NONE, NULL))
+        font = g_key_file_get_string(keys, "view", "chat-font", NULL);
+    g_key_file_free(keys);
+
+    if (font && *font)
+        return font;
+    g_free(font);
+    return g_strdup(WA_DEFAULT_CHAT_FONT);
+}
+
 static int
 resolve_font_size(WaApp *self)
 {
@@ -207,7 +231,7 @@ resolve_font_size(WaApp *self)
  * them. */
 static void
 apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
-           const char *font_spec, int pixels)
+           const char *font_spec, const char *chat_font, int pixels)
 {
     PangoFontDescription *desc = pango_font_description_from_string(font_spec);
     const char *family = pango_font_description_get_family(desc);
@@ -241,14 +265,22 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
         "* { font-family: \"%s\", \"wa-arabic\", system-ui, \"Noto Color Emoji\", "
         "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
         "[contenteditable=\"true\"], [contenteditable=\"true\"] *,"
-        "#main .selectable-text, #main .selectable-text * { line-height: 1.5 !important; }",
-        family);
+        "#main .selectable-text, #main .selectable-text * { line-height: 1.5 !important; }"
+        /* Anything that is a message rather than a control: the bubbles, the
+         * composer, and the names and previews in the chat list. */
+        "#main .selectable-text, #main .selectable-text *,"
+        "[contenteditable=\"true\"], [contenteditable=\"true\"] *,"
+        "#pane-side [role=\"row\"] span[title],"
+        "#pane-side [role=\"row\"] span[title] * {"
+        " font-family: %s, \"Noto Color Emoji\", \"Apple Color Emoji\","
+        " \"Segoe UI Emoji\", sans-serif !important; }",
+        family, chat_font);
     WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
         css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
     webkit_user_content_manager_add_style_sheet(content, sheet);
     webkit_user_style_sheet_unref(sheet);
 
-    g_message("font: %s at %dpx", family, pixels);
+    g_message("font: %s at %dpx, chat text in %s", family, pixels, chat_font);
     g_free(css);
     pango_font_description_free(desc);
 }
@@ -546,6 +578,33 @@ on_eval_done(GObject *source, GAsyncResult *result, gpointer user_data)
     g_object_unref(value);
 }
 
+/* A picture of what is actually on screen. GNOME's Wayland session refuses
+ * screenshots to a process like this one, and questions about text shaping or
+ * emoji cannot be settled from the DOM -- getComputedStyle says what was asked
+ * for, not what was drawn. */
+static void
+on_snapshot_ready(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    GError *error = NULL;
+    GdkTexture *shot = webkit_web_view_get_snapshot_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+
+    if (!shot) {
+        g_message("[snapshot] failed: %s", error ? error->message : "unknown");
+        g_clear_error(&error);
+        return;
+    }
+
+    const char *path = "/tmp/whatsapp-snapshot.png";
+    if (gdk_texture_save_to_png(shot, path))
+        g_message("[snapshot] wrote %dx%d to %s",
+                  gdk_texture_get_width(shot), gdk_texture_get_height(shot), path);
+    else
+        g_message("[snapshot] could not write %s", path);
+
+    g_object_unref(shot);
+}
+
 static void
 on_debug_file_changed(GFileMonitor *monitor, GFile *file, GFile *other,
                       GFileMonitorEvent event, gpointer user_data)
@@ -559,6 +618,14 @@ on_debug_file_changed(GFileMonitor *monitor, GFile *file, GFile *other,
     char *script = NULL;
     if (!g_file_load_contents(file, NULL, &script, NULL, NULL, NULL))
         return;
+
+    if (g_str_has_prefix(g_strstrip(script), "#snapshot")) {
+        webkit_web_view_get_snapshot(self->view, WEBKIT_SNAPSHOT_REGION_VISIBLE,
+                                     WEBKIT_SNAPSHOT_OPTIONS_NONE, NULL,
+                                     on_snapshot_ready, self);
+        g_free(script);
+        return;
+    }
 
     if (*g_strstrip(script))
         webkit_web_view_evaluate_javascript(self->view, script, -1, NULL, NULL,
@@ -689,8 +756,11 @@ configure_memory_pressure(void)
 {
     WebKitMemoryPressureSettings *pressure = webkit_memory_pressure_settings_new();
     webkit_memory_pressure_settings_set_memory_limit(pressure, WA_MEMORY_LIMIT_MB);
-    webkit_memory_pressure_settings_set_conservative_threshold(pressure, WA_CONSERVATIVE_FRAC);
+    /* Strict first: each setter asserts that conservative < strict against the
+     * value currently held, so raising conservative above the default strict
+     * (0.5) is rejected outright and silently leaves the old value in place. */
     webkit_memory_pressure_settings_set_strict_threshold(pressure, WA_STRICT_FRAC);
+    webkit_memory_pressure_settings_set_conservative_threshold(pressure, WA_CONSERVATIVE_FRAC);
     /* Zero disables the kill threshold: shedding caches is fine, losing the
      * window because a chat had too many photos in it is not. */
     webkit_memory_pressure_settings_set_kill_threshold(pressure, 0.0);
@@ -1082,7 +1152,9 @@ build_window(WaApp *self)
                      G_CALLBACK(on_paste_request), self);
 
     char *font_spec = resolve_font(self);
-    apply_font(settings, content, font_spec, resolve_font_size(self));
+    char *chat_font = resolve_chat_font(self);
+    apply_font(settings, content, font_spec, chat_font, resolve_font_size(self));
+    g_free(chat_font);
     g_free(font_spec);
 
     WebKitUserScript *script = webkit_user_script_new(
@@ -1262,6 +1334,24 @@ main(int argc, char **argv)
      * option parsing from rejecting argv. */
     int kept = 1;
     for (int i = 1; i < argc; i++) {
+        /* Answered before GTK is touched, so they work over ssh, in a container,
+         * and anywhere else without a display -- which is also what lets a
+         * packaging test execute the binary it just installed. */
+        if (g_strcmp0(argv[i], "--version") == 0) {
+            g_print("%s %s\n", WA_TITLE, WA_VERSION);
+            return 0;
+        }
+        if (g_strcmp0(argv[i], "--help") == 0 || g_strcmp0(argv[i], "-h") == 0) {
+            g_print("Usage: whatsapp [--hidden] [--version] [--help]\n\n"
+                    "  --hidden   start in the tray without showing a window\n"
+                    "  --version  print the version and exit\n"
+                    "  --help     print this message and exit\n\n"
+                    "Ctrl+V pastes an image, Ctrl +/- zooms, Ctrl+0 resets the zoom,\n"
+                    "Ctrl+Q quits. Closing the window leaves it running in the tray.\n\n"
+                    "Config: %s/whatsapp/whatsapp.conf\n",
+                    g_get_user_config_dir());
+            return 0;
+        }
         if (g_strcmp0(argv[i], "--hidden") == 0)
             self.start_hidden = TRUE;
         else
