@@ -98,8 +98,13 @@ const el = (tag, attrs, text) => new El(tag, attrs, text);
 const root = el('div', {});
 root.__root = true;
 const pane = el('div', { id: 'pane-side' });
-const main = el('div', { id: 'main' });
+/* #main is the conversation pane, and WhatsApp renders it only while a chat is
+   open -- measured on the live page by walking eight conversations open and
+   shut. Closing the chat here means taking it out. */
+let main = el('div', { id: 'main' });
 root.append(pane, main);
+const closeConversation = () => { main.remove(); };
+const openConversation = () => { if (!main.isConnected) root.append(main); };
 
 const two = n => String(n).padStart(2, '0');
 /* The clock a row wears. Rows carry the time of their last message, and the
@@ -274,6 +279,47 @@ const check = (label, got, want) => {
   check('a row that appears at the top unread is still guessed at',
         await describe(), 'Communication Engineer 4 | ~Mo farhat: تم');
   check('but only once', await describe(), '');
+
+  /* A row that is still unread cannot be the conversation on screen: WhatsApp
+     clears that pill the moment it draws a chat in a focused window. Ten
+     messages landing in a chat sitting at ten unread were every one of them
+     answered "the message is in the chat on screen". */
+  update(mega, { badge: 10, preview: 'E', when: clock() });
+  await scan();
+  check('a chat left at ten unread is not the chat on screen',
+        await describe(), 'Mega | E');
+
+  /* And with no conversation pane at all, nothing is on screen. */
+  update(mega, { badge: 0, preview: 'ok', when: clock() });
+  await scan();
+  await describe();
+  closeConversation();
+  update(mega, { preview: 'tamam', when: clock() });
+  await scan();
+  check('with no conversation open, nothing is the chat on screen',
+        await describe(), 'Mega | tamam');
+  openConversation();
+
+  /* An arrival the app never asked about -- the nudge is dropped whenever the
+     window is not active in the moment it lands -- must not be announced when
+     something else asks a minute later. */
+  update(joo, { preview: 'انجز يلا بقى', when: clock(), badge: 1 });
+  await scan();                                    // queued, and nobody asks
+  advance(20000);
+  update(pdf, { preview: 'اوك', when: clock(), badge: 4, sender: 'Mega' });
+  await scan();
+  check('a queued arrival nobody asked about is not announced later',
+        await describe(), 'Pdf & Assignments | Mega: اوك');
+
+  /* Losing focus empties the queue outright: the page owns notifications from
+     there, and it announces the same messages itself. The row is left with no
+     unread pill so that only the queue can answer for it -- the guess below it
+     never speaks for a chat that is caught up. */
+  update(joo, { preview: 'يلا', when: clock(), badge: 0 });
+  await scan();
+  sandbox.window.__whatsappSetFocus(false);
+  sandbox.window.__whatsappSetFocus(true);
+  check('the queue does not survive the window going away', await describe(), '');
 
   console.log(failures ? '\n' + failures + ' failed' : '\nall checks pass');
   process.exit(failures ? 1 : 0);

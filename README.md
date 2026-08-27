@@ -43,13 +43,28 @@ already on screen. The document title cannot do that job: its number counts
 unread *chats*, so a second and third message from the same person leave
 `(1) WhatsApp` exactly as it was.
 
+And **the client must be sure which chat is on screen before it goes quiet about
+one**, because being wrong there is silence, not noise. It went silent for whole
+bursts of messages: ten landed in a conversation sitting at ten unread and every
+one of them was answered "the message is in the chat on screen". Three things
+decide it now, all measured on a live session rather than assumed -- WhatsApp
+draws `#main` only while a conversation is open, the `aria-selected` marker
+always resolves to exactly one row, and a row still wearing an unread pill cannot
+be the chat on screen, since WhatsApp clears that pill the moment it draws a chat
+in a window that has focus.
+
 Two things had to be unlearned there. **Unread is not the same as new**: the app
 asks the page what arrived more often than messages actually land -- the document
 title asks on its own count, off its own clock -- and every ask the watcher could
 not answer used to fall through to "the topmost unread row", which announced one
 chat's last message over and over while the user sat reading another. An ask now
 goes unanswered unless some row has just moved, carries the time it is now, and
-says something this client has not already announced. And **a group says it
+says something this client has not already announced. An arrival also goes stale
+in five seconds rather than thirty: the nudge is dropped whenever the window is
+not active in the moment a message lands -- the page raises its own notification
+then -- and the entry it was for used to wait in the queue until something else
+asked, minutes of alt-tabbing later, and be announced as though it had just
+arrived. And **a group says it
 differently**: a direct chat leaves `typing...` in the list, a group leaves
 `Mega is typing...`, and only the first shape was recognised -- so a group
 announced somebody starting to write as though they had said something.

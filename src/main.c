@@ -31,7 +31,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.6"
+#define WA_VERSION    "1.0.7"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this

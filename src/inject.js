@@ -123,6 +123,11 @@
     state = !!state;
     if (state === focused) return 'unchanged';
     focused = state;
+    /* Nothing queued survives the window going away. From here the page raises
+       its own notifications and the app dresses those instead, so an arrival
+       still waiting to be asked about would be announced a second time the
+       moment the window came back. */
+    if (!focused) arrivals = [];
     // WhatsApp acts on the events, not on a poll of hasFocus().
     window.dispatchEvent(new Event(state ? 'focus' : 'blur'));
     document.dispatchEvent(new Event(state ? 'focus' : 'blur'));
@@ -139,11 +144,21 @@
 
   /* The chat on screen. WhatsApp marks its row aria-selected="true", which beats
      reading the conversation header: the header of a community announcement group
-     carries title="Announcements", not the name of the group. */
+     carries title="Announcements", not the name of the group.
+
+     Two things have to hold, and both were measured on the live page by walking
+     eight conversations open and shut: #main exists only while a conversation is
+     open -- the empty state that replaces it is a different element -- and the
+     marker always resolves to exactly one row. It used to fall back to the
+     marked element itself when it resolved to no row, and that fallback could
+     only ever do harm: an element above the rows contains every one of them, so
+     isOpen would answer "the chat on screen" for the whole list, which is not a
+     quiet banner but no banner at all. */
   const openRow = () => {
+    if (!document.querySelector('#main')) return null;
     const pane = document.querySelector('#pane-side');
     const selected = pane && pane.querySelector('[aria-selected="true"]');
-    return selected ? selected.closest('[role="row"]') || selected : null;
+    return selected ? selected.closest('[role="row"]') : null;
   };
 
   /* Chat names and message previews arrive wrapped in bidi control characters,
@@ -212,6 +227,14 @@
      arrival that had not happened. */
   const rowState = new WeakMap();
   const ARRIVAL_TTL_MS = 30000;
+  /* How long an arrival may wait for the app to ask about it. The nudge is
+     dropped whenever the window is not active in the moment it lands -- the page
+     raises its own notifications then -- and the entry it was for used to sit in
+     the queue for the full thirty seconds, so the next ask after the window came
+     back answered with it and put a banner over a message the user had already
+     been told about. The app asks a quarter of a second after the nudge; past
+     this, nobody is coming. */
+  const ANSWER_WINDOW_MS = 5000;
   /* The list does not arrive in one piece: rows appear, and then their previews,
      their badges and their timestamps fill in behind them. Every one of those is
      a change to a row we have already seen, which is the shape of an arrival --
@@ -450,6 +473,17 @@
   setInterval(watchList, 4000);
   addEventListener('load', watchList);
 
+  /* What the watcher is holding, for WHATSAPP_DEBUG_EVAL and the test rig. Every
+     notification question -- why was this announced, why was that one not --
+     comes down to these five values, and reading them out of a live session beats
+     inferring them from which banners did and did not appear. */
+  window.__whatsappWatcherState = () => JSON.stringify({
+    focused,
+    settled: seeded && Date.now() - seededAt >= SETTLE_MS,
+    open: (() => { const row = openRow(); return row ? nameOf(row) : null; })(),
+    queued: arrivals.map(a => ({ name: a.name, preview: a.preview, age: Date.now() - a.at })),
+  });
+
   /* The row for a chat WhatsApp has re-rendered since. Rows are recycled freely,
      and an arrival whose element was thrown away in the 250ms before the app
      asked about it used to fall through to "nothing identified" -- which is what
@@ -482,12 +516,24 @@
   const isOpen = (row, preview) => {
     const open = openRow();
     if (!open) return false;
-    if (row === open || open.contains(row) || row.contains(open)) return true;
+
+    /* A row still wearing an unread pill is not the conversation on screen,
+       whatever else it looks like. WhatsApp clears that pill the moment it draws
+       a chat in a window that has focus, and this watcher only runs while the
+       window has focus. Without it the client went silent for a whole burst:
+       ten messages landed in a chat sitting at ten unread, and every one of them
+       was answered "the message is in the chat on screen". */
+    if (unreadCount(row) > 0) return false;
+    if (row === open) return true;
 
     const name = nameOf(row);
     if (!name || name !== nameOf(open)) return false;
+    /* Short text cannot carry this test. The message has to be found in the
+       conversation on screen, and a one-letter message is inside the last
+       bubble's text by accident -- with two chats sharing a name, that silenced
+       the wrong one. */
     const text = strip(preview).replace(/\u2026$/, '');
-    return !!text && lastOnScreen().indexOf(text) >= 0;
+    return text.length >= 3 && lastOnScreen().indexOf(text) >= 0;
   };
 
   /* Pictures are fetched once per URL and kept. The same face comes back for
@@ -586,6 +632,7 @@
     let row = null, queued = null;
     while (arrivals.length && !row) {
       queued = arrivals.shift();
+      if (Date.now() - queued.at > ANSWER_WINDOW_MS) { queued = null; continue; }
       row = queued.row.isConnected ? queued.row : findRow(queued.name, queued.preview);
     }
     const fromQueue = !!row;
