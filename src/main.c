@@ -79,6 +79,10 @@
 /* How many notification ids stay clickable. A banner is gone in seconds, but the
  * entry it leaves in the notification centre can be clicked an hour later. */
 #define WA_CLICKABLE 16
+/* How many messages one conversation's entry in the notification centre holds.
+ * Past this the oldest drops off the bottom: the entry is a reminder of what was
+ * missed, not a transcript, and the chat itself is one click away. */
+#define WA_PILE_LINES 8
 /* Notification pictures are written here, one file per distinct face. */
 #define WA_AVATAR_PREFIX "whatsapp-avatar-"
 /* Two reports of the same message from two different places -- the chat list
@@ -121,6 +125,11 @@ typedef struct {
     gint64              at;     /* when it was raised */
     guint               expiry; /* the timer that takes it down; see banner_expire */
     WebKitNotification *page;   /* the page's own notification, when it is one */
+    /* The one entry this conversation keeps in the notification centre, and
+     * everything it has said since the user last cleared it. See banner_file. */
+    guint32             filed;
+    char               *pile;
+    int                 piled;
 } WaBanner;
 
 /* A notification the user can still click, banner or notification-centre entry. */
@@ -1181,10 +1190,22 @@ static void notify_send(WaNotifyCall *call, guint32 replaces);
  * a sound, which is exactly what a copy of something already announced should
  * do. Every message passes through here exactly once: when the next message
  * from the same conversation replaces its banner, or when its banner runs out
- * of time. A banner the user dismissed or clicked is not archived -- they have
- * seen it, and putting it back where they just cleared it is rude. */
+ * of time. A banner the user dismissed or clicked is not filed -- they have
+ * seen it, and putting it back where they just cleared it is rude.
+ *
+ * One conversation gets one entry, not one per message. Ten messages from the
+ * same person used to leave ten rows in the notification centre, each holding a
+ * single line and none of them saying how many others there were, so clearing up
+ * after a busy chat meant dismissing ten of them by hand. The messages are piled
+ * into a body instead and the entry is replaced in place -- which is what the
+ * daemon's replaces_id is for -- so the shell keeps one row per conversation and
+ * offers its arrow when there is more than a line to read.
+ *
+ * Newest first, because the collapsed row shows only the first line and the line
+ * worth showing is the last thing said. The pile is cleared when the entry is:
+ * see on_notification_closed. */
 static void
-banner_archive(WaApp *self, WaBanner *slot, gboolean close_it)
+banner_file(WaApp *self, WaBanner *slot, gboolean close_it)
 {
     if (slot->expiry) {
         g_source_remove(slot->expiry);
@@ -1193,15 +1214,34 @@ banner_archive(WaApp *self, WaBanner *slot, gboolean close_it)
     if (slot->id == 0 || !slot->chat || !slot->body)
         return;
 
+    if (!slot->pile) {
+        slot->pile  = g_strdup(slot->body);
+        slot->piled = 1;
+    } else {
+        char *older = slot->pile;
+        /* Oldest last, so the line that drops off is the one after the final
+         * newline. Nothing to drop means the pile is a single line already. */
+        if (slot->piled >= WA_PILE_LINES) {
+            char *last = g_strrstr(older, "\n");
+            if (last) {
+                *last = '\0';
+                slot->piled--;
+            }
+        }
+        slot->pile = g_strconcat(slot->body, "\n", older, NULL);
+        g_free(older);
+        slot->piled++;
+    }
+
     WaNotifyCall *copy = g_new0(WaNotifyCall, 1);
     copy->app     = self;
     copy->slot    = (int)(slot - self->banners);
     copy->summary = g_strdup(slot->chat);
-    copy->body    = g_strdup(slot->body);
+    copy->body    = g_strdup(slot->pile);
     copy->image   = g_strdup(slot->image);
     copy->page    = slot->page ? g_object_ref(slot->page) : NULL;
     copy->quiet   = TRUE;
-    notify_send(copy, 0);
+    notify_send(copy, slot->filed);
 
     if (!close_it)
         return;
@@ -1242,16 +1282,22 @@ banner_take(WaApp *self, const char *chat, const char *body, const char *image,
         /* Replacing this conversation's banner. What it says now goes into the
          * notification centre first: three messages from one person leave three
          * entries behind, and only the newest of them is ever on screen. */
-        banner_archive(self, slot, FALSE);
+        banner_file(self, slot, FALSE);
     } else {
         slot = &self->banners[self->banner_next];
         self->banner_next = (self->banner_next + 1) % WA_BANNERS;
         /* The conversation being turned out of this slot may still have a banner
-         * up; it is filed and closed rather than abandoned on screen. */
-        banner_archive(self, slot, TRUE);
+         * up; it is filed and closed rather than abandoned on screen. What it
+         * had piled up stays in the notification centre and stops growing -- the
+         * slot is somebody else's now, and the reply to that last filing will
+         * find a different name in it and leave the id alone. */
+        banner_file(self, slot, TRUE);
         g_free(slot->chat);
         slot->chat = g_strdup(chat);
         slot->id = 0;
+        g_clear_pointer(&slot->pile, g_free);
+        slot->piled = 0;
+        slot->filed = 0;
     }
 
     g_free(slot->body);
@@ -1320,7 +1366,7 @@ on_notification_closed(GDBusConnection *bus, const char *sender, const char *pat
     if (id == 0)
         return;
 
-    for (int i = 0; i < WA_BANNERS; i++)
+    for (int i = 0; i < WA_BANNERS; i++) {
         if (self->banners[i].id == id) {
             self->banners[i].id = 0;
             if (self->banners[i].expiry) {
@@ -1328,6 +1374,16 @@ on_notification_closed(GDBusConnection *bus, const char *sender, const char *pat
                 self->banners[i].expiry = 0;
             }
         }
+        /* The pile only ever holds what the user has not dealt with. Once the
+         * entry is gone -- read, dismissed, or the whole list cleared -- the
+         * next message starts a row of its own rather than resurrecting a
+         * conversation the user has just finished with. */
+        if (self->banners[i].filed == id) {
+            self->banners[i].filed = 0;
+            g_clear_pointer(&self->banners[i].pile, g_free);
+            self->banners[i].piled = 0;
+        }
+    }
 }
 
 /* GNOME rings for the sound-name hint and says so; a desktop whose daemon does
@@ -1409,7 +1465,7 @@ banner_expire(gpointer user_data)
 
     g_message("banner taken down after %ds; %s keeps its place in the notification centre",
               WA_BANNER_LIFETIME_S, slot->chat ? slot->chat : WA_TITLE);
-    banner_archive(self, slot, TRUE);
+    banner_file(self, slot, TRUE);
     return G_SOURCE_REMOVE;
 }
 
@@ -1429,8 +1485,16 @@ on_notify_sent(GObject *source, GAsyncResult *result, gpointer user_data)
 
         /* The quiet copy is an entry in the notification centre and nothing
          * more: there is no banner on it to take down, and the conversation's
-         * next message must start a banner of its own rather than replace it --
-         * which is what leaves one entry behind per message. */
+         * next message must start a banner of its own rather than replace it.
+         * Its id is kept so the next message can be piled into the same entry,
+         * and only while the slot still belongs to the conversation that filed
+         * it -- a slot handed to somebody else in the meantime must not have
+         * their messages appended to a stranger's row. */
+        if (call->quiet) {
+            WaBanner *filed = &self->banners[call->slot];
+            if (g_strcmp0(filed->chat, call->summary) == 0)
+                filed->filed = id;
+        }
         if (!call->quiet) {
             WaBanner *slot = &self->banners[call->slot];
             slot->id = id;

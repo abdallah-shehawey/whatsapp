@@ -87,6 +87,15 @@ seconds and the message posted again at `LOW` urgency, which the shell files in
 the notification centre without a banner and without a sound. Nothing is lost and
 nothing blocks.
 
+**And a conversation leaves one entry behind, not one per message.** Ten messages
+from the same person used to file ten rows, each holding a single line and none
+of them saying how many others there were, so clearing up after a busy chat meant
+dismissing ten notifications by hand. They are piled into one body now and the
+entry is replaced in place, newest line first — the collapsed row shows the last
+thing said, and the shell offers its arrow for the rest. Clearing the entry
+clears the pile: the next message starts a row of its own rather than bringing
+back a conversation that was just finished with.
+
 **Emoji arrived blank, every single launch.** They are drawn from 152 sprite
 sheets of about 30 KB each, and nothing on the machine was keeping them:
 WhatsApp's service worker caches its JavaScript but hands the sheets to the
