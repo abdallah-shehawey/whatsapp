@@ -31,7 +31,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.7"
+#define WA_VERSION    "1.0.8"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -362,12 +362,54 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
     char *css = g_strdup_printf(
         "* { font-family: \"%s\", system-ui, \"Noto Sans Arabic\", \"Noto Color Emoji\", "
         "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
-        /* Chat names, previews and message text -- every place a message is read.
-           The composer is left alone on purpose; see above. */
-        "span[title]:not([contenteditable] *),"
-        "span[title]:not([contenteditable] *) *,"
-        "span[dir]:not([contenteditable] *),"
-        "span[dir]:not([contenteditable] *) * { line-height: 1.7 !important; }"
+        /* WebKit sizes a line box from the PRIMARY font alone, so Arabic that
+           arrives as a fallback is measured against a face that has none of it
+           and falls outside the box. Naming the Arabic face first wherever the
+           text reads right to left fixes the measurement; Latin keeps the
+           desktop font. Measured at 20px/1.43: 92.7% of the ink survives with
+           the display face leading, 98.9% with the Arabic face leading. */
+        ":dir(rtl) { font-family: \"Noto Sans Arabic\", \"%s\", system-ui, "
+        "\"Noto Color Emoji\", \"Apple Color Emoji\", \"Segoe UI Emoji\", "
+        "sans-serif !important; }"
+        /* Chat names and previews, and nothing inside the conversation. Whether a
+           taller line box helps or clips depends on WHO carries the
+           overflow:hidden, which is not the same in the two panes. In the list
+           the element that takes this rule is the clipper itself, or sits in a
+           flex parent that grows with it: measured 23.8px of line box in a 23.6px
+           box, and the box had followed the text up from 20px. In a bubble the
+           clipper is a div of WhatsApp's own, pinned at 19px, and this rule lands
+           on a span INSIDE it -- so the text grew to 29.3px inside a box that
+           stayed 23.6px and 5.7px of every line was shorn off. That is the
+           "half the message is missing" report, and the alternating line heights
+           with it: line-height inherits, so a bubble under an ancestor that
+           matched got 23.8px while the next bubble kept 19px, and the words
+           stepped up and down. Proven on a live message by removing its dir
+           attribute so the rule stopped matching: overflow went from +5.7px to
+           -2.9px, i.e. from shorn to nearly three pixels of room to spare.
+           #main is excluded rather than #pane-side named, so the panels either
+           side of them keep the behaviour they already had. */
+        "span[title]:not([contenteditable] *):not(#main *),"
+        "span[title]:not([contenteditable] *):not(#main *) *,"
+        "span[dir]:not([contenteditable] *):not(#main *),"
+        "span[dir]:not([contenteditable] *):not(#main *) * { line-height: 1.7 !important; }"
+        /* What is left after the rule above stops at the conversation is the
+           bubble's own clip, and it is small and exact: the last line of Arabic
+           loses three device rows, about 2.1px, and then the background is clean.
+           Measured by setting overflow:visible on the clipping div in a live chat
+           and counting ink rows past the old edge -- 64, 64, 54, 36, then zero.
+           So the box is given 0.2em (2.8px at this size) of extra room to clip
+           against and the negative margin hands the space straight back, which
+           leaves every other height in the pane exactly as WhatsApp set it.
+           This is the same trick that was tried once before and reverted; what
+           was wrong with it then was the selector, not the idea. It reached for
+           div:has(> span[title]), which exists in the list and not in a bubble,
+           so it reshaped the one place that was already correct and missed the
+           one that was not. The clipping box in a bubble is the div directly
+           under .copyable-text -- measured, three of three on screen -- and
+           naming it keeps the change inside the conversation. The contenteditable
+           is excluded because the composer is handled on its own below. */
+        "#main div.copyable-text:not([contenteditable]) > div"
+        "{ padding-bottom: 0.2em !important; margin-bottom: -0.2em !important; }"
         /* The composer clips the same way and cannot be given a taller line box,
            so it is given a taller clip instead: padding grows the box that
            overflow:hidden cuts against, and the negative margin hands the space
@@ -376,7 +418,7 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
            clientHeight, where a line-height override left it one pixel over. */
         "[contenteditable=\"true\"]"
         "{ padding-bottom: 0.35em !important; margin-bottom: -0.35em !important; }",
-        family);
+        family, family);
     WebKitUserStyleSheet *sheet = webkit_user_style_sheet_new(
         css, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
     webkit_user_content_manager_add_style_sheet(content, sheet);
