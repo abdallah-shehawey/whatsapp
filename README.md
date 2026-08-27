@@ -43,6 +43,17 @@ already on screen. The document title cannot do that job: its number counts
 unread *chats*, so a second and third message from the same person leave
 `(1) WhatsApp` exactly as it was.
 
+Two things had to be unlearned there. **Unread is not the same as new**: the app
+asks the page what arrived more often than messages actually land -- the document
+title asks on its own count, off its own clock -- and every ask the watcher could
+not answer used to fall through to "the topmost unread row", which announced one
+chat's last message over and over while the user sat reading another. An ask now
+goes unanswered unless some row has just moved, carries the time it is now, and
+says something this client has not already announced. And **a group says it
+differently**: a direct chat leaves `typing...` in the list, a group leaves
+`Mega is typing...`, and only the first shape was recognised -- so a group
+announced somebody starting to write as though they had said something.
+
 The page is told the truth about focus, pushed in from GTK, because WebKit gets
 it wrong: a view in a window hidden in the tray still reports itself focused.
 Pinning the answer to `false` was tried and is a trap — it does produce
@@ -69,7 +80,8 @@ nothing blocks.
   document title. No number is drawn anywhere
 - One notification per message, with the sender, the text and the sender's
   picture on it. Messages sent from the phone raise nothing, and neither does the
-  `typing...` the other side leaves in the chat list while writing
+  `typing...` the other side leaves in the chat list while writing, in a group
+  or a direct chat and in either language
 - Every message stays in the notification centre after its banner has gone,
   including each one of a burst from the same conversation
 - A notification for a message that lands in the chat already on screen is
@@ -120,9 +132,17 @@ make
 make install        # ~/.local/bin plus a desktop entry and icons
 make autostart      # also start hidden at login
 make no-autostart   # undo just the autostart part
+make test-inject    # replay a chat list past src/inject.js, no browser needed
 ```
 
 `make install` honours `DESTDIR` and `PREFIX`, so the tree packages cleanly.
+
+`make test-inject` is where the notification logic is exercised. Every bug it has
+had was found by hand on a live session -- which means waiting for somebody to
+write to you, and being unable to reproduce what you just saw. The watcher only
+reaches the page through a handful of selectors, so a mock chat list is enough to
+move a row the way WhatsApp moves one and ask the page what arrived. It needs
+`node`, and nothing else.
 
 ## Keys
 
@@ -141,6 +161,7 @@ make no-autostart   # undo just the autostart part
 | `src/tray.c` | StatusNotifierItem over raw GDBus — GTK4 has no tray, and libayatana-appindicator is packaged for GTK2/GTK3 only, neither linkable into a GTK4 process |
 | `src/inject.js` | page-side helpers, compiled into the binary |
 | `tools/make-icons.py` | regenerates `data/icons` — `make icons`, never hand-edit the PNGs |
+| `tools/test-inject.js` | replays a chat list past `src/inject.js` — `make test-inject` |
 
 State lives in `~/.local/share/whatsapp`, config in `~/.config/whatsapp`.
 

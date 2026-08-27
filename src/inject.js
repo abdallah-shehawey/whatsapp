@@ -224,13 +224,28 @@
   let seededAt = 0;
 
   /* The preview WhatsApp shows while the other side is writing, in the languages
-     this client is likely to be run in. A group row carries the name in front of
-     it ("Ahmed: typing..."), hence the optional prefix. Anchored at both ends on
-     purpose: a message that merely begins with the word "typing" is a message,
-     and swallowing it would cost a banner. \b cannot do that job here -- it is
-     defined on ASCII word characters, so it never matches after Arabic. */
-  const TYPING_PREVIEW =
-      /^(?:[^:]{1,40}:\s*)?(typing|recording(?: audio)?|\u064a\u0643\u062a\u0628|\u064a\u0633\u062c\u0644)\s*(?:\.{1,3}|\u2026)?$/i;
+     this client is likely to be run in. It comes in three shapes, and only the
+     first was matched before: the bare "typing..." of a direct chat, "Mega is
+     typing..." in an English group -- which is why a group announced somebody
+     starting to write as though they had said something -- and "Ahmed: typing...",
+     where the sender is written the way it is written in front of a message.
+
+     Anchored at both ends on purpose: a message that merely begins with the word
+     "typing" is a message, and swallowing it would cost a banner. \b cannot do
+     that job here -- it is defined on ASCII word characters, so it never matches
+     after Arabic. The name in front is matched loosely and the verb strictly,
+     and English has to put a colon or a copula between the two; only Arabic gets
+     the bare space its grammar needs ("\u0645\u064a\u062c\u0627 \u064a\u0643\u062a\u0628"). */
+  const TYPING_VERB    = 'typing|recording(?: audio)?';
+  const TYPING_VERB_AR = '\u064a\u0643\u062a\u0628|\u064a\u0633\u062c\u0644';
+  const TYPING_END     = '\\s*(?:\\.{1,3}|\u2026)?$';
+  const TYPING_PREVIEW = new RegExp([
+    '^(?:' + TYPING_VERB + '|' + TYPING_VERB_AR + ')' + TYPING_END,
+    '^[^:]{1,40}:\\s*(?:' + TYPING_VERB + '|' + TYPING_VERB_AR + ')' + TYPING_END,
+    '^.{1,40}?\\s+(?:is|are)\\s+(?:' + TYPING_VERB + ')' + TYPING_END,
+    '^.{1,40}?\\s+(?:' + TYPING_VERB_AR + ')' + TYPING_END,
+  ].join('|'), 'i');
+  const isTyping = preview => TYPING_PREVIEW.test(preview || '');
 
   /* What is read off a row on every pass. Three things move when a message
      lands, and it takes all three to catch every one: the preview, because that
@@ -246,6 +261,17 @@
       badge:   unreadCount(row),
       when:    ((row.innerText || '').match(/\b\d{1,2}:\d{2}(?:\s*[AP]M)?\b/) || [''])[0],
     };
+  };
+
+  /* Who spoke, in a group row: the sender is its own element followed by a bare
+     ":" element, and a one-to-one row has neither. Verified against live rows:
+     groups yield "You", "+20 11 18856364", "@eng_mahmoudmajed", and direct chats
+     correctly yield nothing. Reading the position of that ":" beats matching
+     WhatsApp's class names, which are obfuscated and rotate every build. */
+  const senderIn = row => {
+    const lines = (row.innerText || '').split('\n').map(strip);
+    const colon = lines.indexOf(':');
+    return colon > 0 ? lines[colon - 1] : '';
   };
 
   /* Whether the time a row shows is the time it is now. WhatsApp stamps a row
@@ -292,6 +318,54 @@
     return fresh === null ? now.badge > before.badge : fresh;
   };
 
+  /* What this client has already put on screen, so the guess at the bottom of
+     __whatsappDescribeUnread cannot say the same thing twice. Two records,
+     because the two notification paths know different things: a reading, for the
+     banners this side describes, and a bare chat name for the ones WhatsApp Web
+     raises while the window is away -- a page notification arrives as a name and
+     nothing else.
+
+     This is what the duplicate banner was made of. With one chat open and
+     another left unread, every ask the queue could not answer -- and the
+     document title asks on its own, off its own count -- fell through to "the
+     topmost unread row" and announced that chat's last message a second time,
+     minutes after it had arrived and been announced. */
+  const ANNOUNCED_TTL_MS = 10 * 60 * 1000;
+  const NAME_TTL_MS      = 60 * 1000;
+  /* How long after a row moves the guess may still credit an ask to it. The app
+     asks a quarter second after it is nudged, so this is generous already. */
+  const GUESS_WINDOW_MS  = 10 * 1000;
+  const announced      = new Map();
+  const announcedNames = new Map();
+
+  const sweep = (map, ttl) => {
+    const now = Date.now();
+    if (map.size > 128)
+      for (const [key, at] of map) if (now - at > ttl) map.delete(key);
+  };
+  /* Deliberately without the unread count: the pill is drawn a beat after the
+     preview, so the same message can be read once with a badge and once
+     without, and a key that disagreed with itself would let the guess through. */
+  const readingKey = state => [state.name, state.preview, state.when].join('\u001f');
+
+  const wasAnnounced = state => {
+    const now   = Date.now();
+    const said  = announced.get(readingKey(state));
+    const named = announcedNames.get(state.name);
+    return (said  !== undefined && now - said  < ANNOUNCED_TTL_MS) ||
+           (named !== undefined && now - named < NAME_TTL_MS);
+  };
+  const rememberAnnounced = state => {
+    announced.set(readingKey(state), Date.now());
+    sweep(announced, ANNOUNCED_TTL_MS);
+  };
+  const rememberName = name => {
+    const wanted = strip(name);
+    if (!wanted) return;
+    announcedNames.set(wanted, Date.now());
+    sweep(announcedNames, NAME_TTL_MS);
+  };
+
   const scanList = () => {
     const pane = document.querySelector('#pane-side');
     if (!pane) return;
@@ -308,9 +382,22 @@
          WhatsApp writes in the preview while the other side is still writing --
          it announced "Mega -- typing..." as though it were something somebody
          had said -- and an empty preview is a row mid-render. */
-      if (TYPING_PREVIEW.test(now.preview)) continue;
+      if (isTyping(now.preview)) continue;
       if (!now.preview && before !== undefined) continue;
 
+      /* When this row last said something different. The guess leans on it: a
+         row that has been showing the same message since before the ask is not
+         the row the message being asked about landed in. A row seen for the
+         first time counts as having just changed -- one appearing at the top of
+         the list is the whole reason the guess exists -- but only once the list
+         has settled, or a chat left unread since yesterday would be announced
+         on the opening pass, which is the same startup phantom the queue's own
+         settle guard exists for. */
+      const settled = seeded && Date.now() - seededAt >= SETTLE_MS;
+      now.changedAt = !settled ? 0
+                    : (before && before.preview === now.preview &&
+                       before.when === now.when && before.badge === now.badge)
+                    ? before.changedAt : Date.now();
       rowState.set(row, now);
 
       /* A row we are seeing for the first time is not news -- only one we
@@ -330,7 +417,8 @@
       /* Queued per message rather than per chat: the app asks once for each one,
          and collapsing them here is what swallowed the second and third message
          of a burst from the same person. */
-      arrivals.push({ row, name: now.name, preview: now.preview, at: Date.now() });
+      arrivals.push({ row, name: now.name, preview: now.preview,
+                      sender: senderIn(row), at: Date.now() });
       ping();
     }
 
@@ -458,6 +546,13 @@
     const wanted = strip(name);
     if (!wanted) return '';
 
+    /* This is only ever asked while a banner for that chat is on its way out, so
+       it doubles as the record of it. Nothing else tells this side that WhatsApp
+       Web announced something while the window was away, and without it the
+       guess below would announce the same chat again the moment the window came
+       back and anything asked. */
+    rememberName(wanted);
+
     const pane = document.querySelector('#pane-side');
     const rows = [...(pane ? pane.querySelectorAll('[role="row"]') : [])];
     let match = rows.find(row => nameOf(row) === wanted);
@@ -493,6 +588,7 @@
       queued = arrivals.shift();
       row = queued.row.isConnected ? queued.row : findRow(queued.name, queued.preview);
     }
+    const fromQueue = !!row;
     /* The message landed in the chat on screen: the user is reading it as it
        arrives and WhatsApp plays its own tone, so a banner over the top of the
        very conversation it came from is noise. */
@@ -504,12 +600,29 @@
        element we have no previous reading for. The topmost unread row is the one
        WhatsApp just moved up there. This is a guess, and it is confined to the
        case where there is nothing better -- the queue is what answers every
-       message from a chat already on the list. */
+       message from a chat already on the list.
+
+       Unread is not the same thing as new, and reading that as though it were is
+       what announced a chat's last message over and over while the user sat in a
+       different conversation: the app asks more often than messages arrive, the
+       queue answers only the real ones, and every other ask took the oldest
+       unread row on the list for news. So the guess now has to clear what the
+       queue clears -- a row that has just moved, a clock that says now, and
+       something this client has not already said. */
     if (!row) {
       const pane = document.querySelector('#pane-side');
       for (const candidate of (pane ? pane.querySelectorAll('[role="row"]') : [])) {
         if (!unreadCount(candidate)) continue;
         if (isOpen(candidate, '') || isMuted(candidate) || isOutgoing(candidate)) continue;
+
+        /* The reading scanList just took, which carries when the row last said
+           something different; a row it has never read has no changedAt and is
+           left alone. */
+        const state = rowState.get(candidate);
+        if (!state || isTyping(state.preview)) continue;
+        if (!state.changedAt || Date.now() - state.changedAt > GUESS_WINDOW_MS) continue;
+        if (freshness(state.when) !== true) continue;
+        if (wasAnnounced(state)) continue;
         row = candidate;
         break;
       }
@@ -519,19 +632,27 @@
     if (!row) return '';
 
     const state = readRow(row);
-    if (!state.name || !state.preview) return '';
+    /* The sender can start writing again in the quarter second between the
+       arrival and this call, and then the row reads "Mega is typing..." -- which
+       is a banner announcing that somebody has begun to type. What goes out is
+       the message that was queued; if there is no queued message behind it, the
+       row has nothing to report and nothing is raised. */
+    const moved = isTyping(state.preview);
+    const preview = !moved ? state.preview
+                  : (fromQueue && !isTyping(queued.preview) ? queued.preview : '');
+    if (!state.name || !preview) return '';
 
-    /* In a group row the sender is its own element followed by a bare ":"
-       element; a one-to-one row has neither. Verified against live rows: groups
-       yield "You", "+20 11 18856364", "@eng_mahmoudmajed", and direct chats
-       correctly yield nothing. Reading the position of that ":" beats matching
-       WhatsApp's class names, which are obfuscated and rotate every build. */
-    const lines = (row.innerText || '').split('\n').map(strip);
-    const colon = lines.indexOf(':');
-    const sender = colon > 0 ? lines[colon - 1] : '';
+    /* Said once, and the guess will not say it again. */
+    rememberAnnounced({ name: state.name, preview: preview, when: state.when });
+    if (preview !== state.preview) rememberAnnounced(state);
+
+    /* Read off the row, unless the row has moved on and the message is the one
+       that was queued -- then so is the sender, or a group message would go out
+       with nobody's name on it. */
+    const sender = moved ? (queued.sender || '') : senderIn(row);
 
     // The separator below cannot occur in a chat name or in a message.
-    return [state.name, sender, state.preview, await avatarOf(row)].join('\u001f');
+    return [state.name, sender, preview, await avatarOf(row)].join('\u001f');
   };
 
   /* Emoji are sprite sheets referenced from generated CSS, and each one is only

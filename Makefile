@@ -77,7 +77,12 @@ uninstall: no-autostart
 icons:
 	python3 tools/make-icons.py
 
+# Replays a chat list past src/inject.js in plain node -- no browser, no account.
+# Every notification bug this client has had lived in that file.
+test-inject:
+	@node tools/test-inject.js
+
 clean:
 	rm -f $(BIN) $(GEN)
 
-.PHONY: all install autostart no-autostart uninstall icons clean
+.PHONY: all install autostart no-autostart uninstall icons test-inject clean
