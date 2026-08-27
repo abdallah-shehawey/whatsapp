@@ -31,7 +31,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.8"
+#define WA_VERSION    "1.0.9"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -49,10 +49,13 @@
  *
  * Measured, not guessed: a signed-in web process sits at ~1330 MB, so the old
  * 1600 MB ceiling put the strict threshold (70% = 1120 MB) permanently below the
- * working set. WebKit then shed caches without pause, and the visible symptom was
- * emoji sprite sheets being dropped and re-fetched -- "the emoji are broken when
- * I open WhatsApp". The ceiling has to sit above the working set for the handler
- * to do what it is for: catching runaway growth, not fighting normal use. */
+ * working set, and WebKit shed caches without pause. The ceiling has to sit above
+ * the working set for the handler to do what it is for: catching runaway growth,
+ * not fighting normal use.
+ *
+ * This was once blamed for the blank emoji as well, and it was not the cause.
+ * The sheets were never cached at all -- see the emoji block in inject.js, which
+ * is where that is now fixed. */
 #define WA_MEMORY_LIMIT_MB     2560
 #define WA_CONSERVATIVE_FRAC   0.55
 #define WA_STRICT_FRAC         0.85
@@ -1899,8 +1902,16 @@ build_window(WaApp *self)
      *
      * So the page is told the resolution it is really being drawn at. Resolution
      * queries are the only ones answered here; everything else, prefers-color-
-     * scheme included, goes through to WebKit untouched. */
-    if (zoom >= 1.25) {
+     * scheme included, goes through to WebKit untouched.
+     *
+     * Asked for at any zoom above 1, not at 1.25 as it once was. A 40px tile
+     * stretched to 48 device pixels is soft in exactly the way a 64px one
+     * squeezed into 48 is not, so the old threshold left a band of zoom levels
+     * looking worse than the ones either side of it. What paid for the threshold
+     * was bandwidth -- the 2x sheets are four times the bytes -- and the emoji
+     * cache in inject.js has since made that a first-run cost rather than a cost
+     * of every launch. At zoom 1 the 1x sheets are pixel-exact and are kept. */
+    if (zoom > 1.0) {
         char *hidpi = g_strdup_printf(
             "(() => {"
             "  const ratio = %d;"
@@ -1918,7 +1929,7 @@ build_window(WaApp *self)
             "             dispatchEvent() { return false; } };"
             "  };"
             "})();",
-            2);   /* the sheets come in 1x and 2x; anything above 1.25 wants the 2x */
+            2);   /* the sheets come in 1x and 2x, and any zoom at all wants the 2x */
         WebKitUserScript *ratio = webkit_user_script_new(
             hidpi, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
             WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);

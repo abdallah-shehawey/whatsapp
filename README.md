@@ -87,6 +87,26 @@ seconds and the message posted again at `LOW` urgency, which the shell files in
 the notification centre without a banner and without a sound. Nothing is lost and
 nothing blocks.
 
+**Emoji arrived blank, every single launch.** They are drawn from 152 sprite
+sheets of about 30 KB each, and nothing on the machine was keeping them:
+WhatsApp's service worker caches its JavaScript but hands the sheets to the
+network, and WebKit's disk cache stored none of them — 55 records on disk and not
+one an image. So every start pulled the same 4.7 MB down again, all 152 at once
+over six connections, and the emoji panel sat full of blank squares until it
+finished. The client keeps them itself now, in CacheStorage, which does survive a
+restart. Both of the ways a sheet is asked for are served from the stored copy:
+the generated `background-image` rules are overridden with a `blob:` URL, and
+WhatsApp's own preload — one XHR per sheet — is pointed at the same URL. Measured
+across a restart: **328 requests and 9.3 MB became 2 requests and 0.05 MB**. The
+first run still downloads them once; every run after it draws emoji offline.
+
+A note on the softness that came with it: WhatsApp picks 1x or 2x sheets from the
+display resolution, and a Wayland session at scale 1 gets the 40px tiles however
+far the view is zoomed. The client answers resolution queries for the page with
+the scale it is really drawn at, and now does so at any zoom above 1 rather than
+above 1.25 — squeezing a 64px tile is sharp where stretching a 40px one is not,
+and the sheets cost nothing after the first run.
+
 ## What it does
 
 - Starts hidden at login and lives in the tray; the page still loads and

@@ -702,32 +702,175 @@
     return [state.name, sender, preview, await avatarOf(row)].join('\u001f');
   };
 
-  /* Emoji are sprite sheets referenced from generated CSS, and each one is only
-     fetched when an emoji that lives on it first has to be drawn -- which is why
-     emoji show up as blank gaps for the first moments after a cold start, and
-     why they all went blank at once when the app switched to the 2x sheets. The
-     sheets are ~15 KB each and never change, so warming them while the browser
-     is idle costs nothing and removes the gap entirely. */
-  const warmEmojiSheets = () => {
-    const urls = new Set();
-    for (const sheet of document.styleSheets) {
-      try {
-        for (const rule of sheet.cssRules) {
-          const m = rule.cssText && rule.cssText.match(/url\("([^"]*\/sprite\/[^"]*)"\)/);
-          if (m) urls.add(m[1]);
-        }
-      } catch (e) { /* a cross-origin sheet cannot be walked; skip it */ }
-    }
-    urls.forEach(u => { const i = new Image(); i.src = u; });
-    if (urls.size) log('warmed ' + urls.size + ' emoji sheets');
+  /* --------------------------------------------------------- emoji sheets */
+
+  /* Emoji are drawn from sprite sheets -- 152 of them, around 30 KB each -- and
+     nothing on this machine was keeping them. Measured on a signed-in session:
+     WhatsApp's service worker caches its JavaScript in CacheStorage but hands
+     the sheets straight to the network, and WebKit's disk cache stores none of
+     them either -- 55 records on disk and not one an image, a sheet fetched and
+     then looked for never there. So every launch pulled the same 4.7 MB down
+     again, all 152 at once over six connections at about a second each, and the
+     emoji panel sat full of blank squares for as long as that took. That is the
+     "the emoji are broken when I open WhatsApp" report, and it is not memory
+     pressure dropping them: they were never stored to begin with.
+
+     What used to be here made it worse. Warming the sheets with `new Image()`
+     raced WhatsApp's own preload for the same bytes over the same connections,
+     so a cold start fetched 8.3 MB instead of 4.7 MB -- measured, 3.68 MB of it
+     ours -- and both halves arrived slower for the company.
+
+     So the client keeps them itself, in CacheStorage, which does survive a
+     restart: a sheet stored before one reads back afterwards in 0 ms. Two
+     things then use the stored copy, because the sheets are asked for twice.
+     The generated `.b82 { background-image: url(...) }` rules are overridden
+     with a blob: URL, so drawing an emoji never touches the network -- the
+     page's own CSP allows blob: in img-src, and a blob: background does paint.
+     And WhatsApp's preload, one XHR per sheet, is pointed at the same blob:
+     URL, so the request still happens and costs nothing.
+
+     The first run still downloads the sheets once. Every run after it is
+     offline, and the panel is drawn by the time it can be opened. */
+  const EMOJI_CACHE = 'wa-emoji-v1';
+
+  const sheets = new Map();   // sprite URL -> blob: URL of the stored copy
+  const rules  = new Map();   // CSS selector -> the sprite URL it asks for
+  const walked = new WeakMap();
+  let   sheetStyle = null;
+
+  const spriteIn = value => {
+    const m = value && value.match(/url\("([^"]*\/emoji\/[^"]*\/sprite\/[^"]*)"\)/);
+    return m ? m[1] : null;
   };
 
-  addEventListener('load', () => {
-    const idle = window.requestIdleCallback || (fn => setTimeout(fn, 3000));
-    idle(warmEmojiSheets, { timeout: 8000 });
-    // WhatsApp generates most sprite rules only once the chat list is drawn.
-    setTimeout(() => idle(warmEmojiSheets, { timeout: 8000 }), 12000);
-  });
+  /* Only sheets whose rule count moved are walked again: WhatsApp generates its
+     sprite rules with insertRule into a stylesheet it already owns, so no
+     mutation fires for them and this has to be looked for rather than waited
+     on. Counting first keeps the looking cheap. */
+  const collectRules = () => {
+    let added = 0;
+    /* A style rule is read before its children rather than instead of them:
+       CSS nesting gave CSSStyleRule a cssRules of its own, so "has children"
+       stopped meaning "is a grouping rule" and testing for it first skipped
+       every rule that mattered. Empty lists are common; length is the test. */
+    const visit = list => {
+      for (const rule of list) {
+        const url = rule.style && spriteIn(rule.style.backgroundImage);
+        if (url && rule.selectorText && !rules.has(rule.selectorText)) {
+          rules.set(rule.selectorText, url);
+          added++;
+        }
+        if (rule.cssRules && rule.cssRules.length) visit(rule.cssRules);
+      }
+    };
+    for (const sheet of document.styleSheets) {
+      let list;
+      try { list = sheet.cssRules; } catch (e) { continue; }  // cross-origin
+      if (walked.get(sheet) === list.length) continue;
+      walked.set(sheet, list.length);
+      visit(list);
+    }
+    return added;
+  };
+
+  const applySheets = () => {
+    const css = [];
+    for (const [selector, url] of rules) {
+      const blob = sheets.get(url);
+      if (blob) css.push(selector + '{background-image:url("' + blob + '") !important}');
+    }
+    if (!css.length) return;
+    if (!sheetStyle) {
+      sheetStyle = document.createElement('style');
+      document.documentElement.appendChild(sheetStyle);
+    }
+    const text = css.join('\n');
+    if (sheetStyle.textContent !== text) sheetStyle.textContent = text;
+  };
+
+  /* Everything before /sprite/ carries the emoji revision. When WhatsApp moves
+     to a new one the old sheets are dead weight, so they go. */
+  const revisionOf = url => url.slice(0, url.indexOf('/sprite/'));
+
+  const store = async () => {
+    const wanted = [...new Set(rules.values())].filter(u => !sheets.has(u));
+    if (!wanted.length) return;
+
+    const cache = await caches.open(EMOJI_CACHE);
+    const revision = revisionOf(wanted[0]);
+    let stored = 0;
+
+    /* Six at a time, which is what the connection pool would allow anyway, and
+       force-cache so a sheet WhatsApp's preload just pulled is taken from
+       memory instead of fetched a second time. */
+    const queue = wanted.slice();
+    const worker = async () => {
+      for (let url = queue.shift(); url; url = queue.shift()) {
+        try {
+          const res = await fetch(url, { cache: 'force-cache' });
+          if (!res.ok) continue;
+          await cache.put(url, res.clone());
+          sheets.set(url, URL.createObjectURL(await res.blob()));
+          stored++;
+        } catch (e) { /* offline, or the sheet moved; the page keeps its own URL */ }
+      }
+    };
+    await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
+
+    for (const req of await cache.keys()) {
+      if (revisionOf(req.url) !== revision) await cache.delete(req);
+    }
+
+    if (stored) {
+      applySheets();
+      log('emoji: stored ' + stored + ' sheets, ' + sheets.size + ' held');
+    }
+  };
+
+  const scan = () => { if (collectRules()) { applySheets(); store(); } };
+
+  /* Read back at document-start rather than on load: WhatsApp's preload goes out
+     about seven seconds in, and the XHRs below can only be pointed at a stored
+     copy that is already in hand. Reading 152 of them takes a few milliseconds. */
+  (async () => {
+    try {
+      const cache = await caches.open(EMOJI_CACHE);
+      for (const req of await cache.keys()) {
+        const res = await cache.match(req);
+        if (res) sheets.set(req.url, URL.createObjectURL(await res.blob()));
+      }
+      if (sheets.size) {
+        log('emoji: ' + sheets.size + ' sheets held from a previous run');
+        applySheets();
+      }
+    } catch (e) { log('emoji: cache unavailable: ' + e.message); }
+  })();
+
+  /* WhatsApp preloads every sheet by XHR to warm a cache that, here, never
+     kept them. The request is left alone in shape and simply pointed at the
+     copy already on disk. */
+  const nativeOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    const held = typeof url === 'string' && /^GET$/i.test(method) ? sheets.get(url) : null;
+    return nativeOpen.call(this, method, held || url, ...rest);
+  };
+
+  /* Watched from document-start rather than from load, and closely at first.
+     WhatsApp generates the rules as the chat list draws, and every one of them
+     that exists before the override is written fetches its sheet over the
+     network -- measured at 15 sheets and 0.40 MB when the first pass waited for
+     load, which is exactly the emoji visible in the list on first paint. The
+     rest of the rules arrive when the emoji panel is first opened, and that may
+     be an hour later, so the watch slows down but never stops. A tick that
+     finds nothing costs a walk of six stylesheet lengths: sheets whose rule
+     count has not moved are not read. */
+  let ticks = 0;
+  let timer = setInterval(() => {
+    scan();
+    if (++ticks < 60) return;
+    clearInterval(timer);
+    timer = setInterval(scan, 5000);
+  }, 250);
 
   log('UA: ' + navigator.userAgent);
   log('inject.js ready on ' + location.host);

@@ -167,7 +167,14 @@ const sandbox = {
   document, console,
   navigator: { userAgent: 'test' },
   location: { host: 'web.whatsapp.com' },
-  setTimeout, clearTimeout,
+  setTimeout, clearTimeout, clearInterval,
+  /* The emoji-sheet cache reaches for both of these at document-start. Nothing
+     here exercises it -- there are no stylesheets to read sprite rules from --
+     but the file has to load, so the surface it touches has to exist. */
+  XMLHttpRequest: class { open() {} },
+  caches: { open: async () => ({ keys: async () => [], match: async () => null,
+                                 put: async () => {}, delete: async () => {} }) },
+  URL: { createObjectURL: () => 'blob:test' },
   /* watchList is installed on an interval in the page; here it runs once and
      the observer it registers is driven by hand, one pass at a time. */
   setInterval: fn => { fn(); return 0; },
