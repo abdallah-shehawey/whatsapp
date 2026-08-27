@@ -141,6 +141,15 @@ and the sheets cost nothing after the first run.
 
 ## Install
 
+On Arch Linux, download `PKGBUILD` from the matching GitHub release, then build and install it with:
+
+```sh
+makepkg -si
+```
+
+The package declares the GTK4, WebKitGTK 6, GLib and icon-theme runtime dependencies.
+
+
 From the [shinux repository](https://abdallah-shehawey.github.io/shinux/), which
 carries signed builds for both families:
 
