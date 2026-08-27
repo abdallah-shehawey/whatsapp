@@ -77,4 +77,7 @@ uninstall: no-autostart
 icons:
 	python3 tools/make-icons.py
 
+clean:
+	rm -f $(BIN) $(GEN)
+
 .PHONY: all install autostart no-autostart uninstall icons clean

@@ -25,18 +25,41 @@ quirks that rewrite the user agent for a list of hosts including whatsapp.com,
 and the quirk beats whatever the application sets — so setting a Chrome user
 agent is not enough on its own, `enable-site-specific-quirks` has to go off too.
 
-**Notifications went missing while the window was open.** WhatsApp Web
-suppresses them when it believes the window is focused, so the client raises its
-own — one per message, driven by a watch on the chat list rather than by the
-document title. The title only counts unread *chats*: a second and a third
-message from the same person leave `(1) WhatsApp` exactly as it was, and every
-one of them used to arrive in silence behind the first one's banner.
+**Notifications were unreliable in every direction** — silent for some
+messages, stuck on screen for others, and inventing a few that never happened.
+There are two halves to getting them right, split on where the focus is.
+
+*While the window is away*, WhatsApp Web raises its own notification, and it is
+by far the better judge: it knows the sender, the text, the mute state, and that
+what arrived is a message rather than a typing indicator or something sent from
+the phone. What it cannot do is dress one — WebKit's default handler shows a
+silent banner that lingers. So the client intercepts every notification the page
+raises and sends it on itself, with the tone, the sender's picture, and a click
+that opens the conversation it came from.
+
+*While the window is in front*, WhatsApp stays silent, so the client watches the
+chat list instead — one banner per message, and none at all for the conversation
+already on screen. The document title cannot do that job: its number counts
+unread *chats*, so a second and third message from the same person leave
+`(1) WhatsApp` exactly as it was.
 
 The page is told the truth about focus, pushed in from GTK, because WebKit gets
 it wrong: a view in a window hidden in the tray still reports itself focused.
 Pinning the answer to `false` was tried and is a trap — it does produce
 notifications, and it also convinces WhatsApp nobody is looking, so chats the
 user reads never get their receipts.
+
+**Banners came down on the client's own clock, in the end.** GNOME reads the
+`expire_timeout` of a notification and throws it away: a banner leaves the screen
+when the user has been active *and* the pointer is not resting on it. Since the
+shell shows one banner at a time, queues three behind it and drops the rest, a
+single banner parked under an idle mouse pointer silently swallows every message
+that follows. Measured live: with one stuck, six notifications produced no banner
+and no sound between them, including one sent at `CRITICAL` urgency — and the
+moment it went away, the next one rang. Each banner is now closed after twelve
+seconds and the message posted again at `LOW` urgency, which the shell files in
+the notification centre without a banner and without a sound. Nothing is lost and
+nothing blocks.
 
 ## What it does
 
@@ -47,9 +70,18 @@ user reads never get their receipts.
 - One notification per message, with the sender, the text and the sender's
   picture on it. Messages sent from the phone raise nothing, and neither does the
   `typing...` the other side leaves in the chat list while writing
+- Every message stays in the notification centre after its banner has gone,
+  including each one of a burst from the same conversation
 - A notification for a message that lands in the chat already on screen is
   skipped -- the user is reading it as it arrives, and WhatsApp plays its own
   tone for it
+- Nothing is announced that the client cannot name. A row the chat list rewrote
+  during a sync is not a message: an arrival has to carry the current clock, so
+  the backlog that syncs in over the first half-minute after a launch stays quiet
+- Pictures are stored under a name taken from the picture itself, because a
+  notification holds the *path* of its icon and the shell reads it lazily -- a
+  rotating name meant a later message could rewrite the file under a banner that
+  was still on screen, and put one sender's face on another sender's message
 - Links open in the desktop's browser rather than inside the client
 - Follows the desktop's dark/light preference and interface font
 - Downloads land in `~/Downloads`

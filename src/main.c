@@ -20,6 +20,7 @@
  */
 #include <stdlib.h>
 
+#include <glib/gstdio.h>
 #include <gtk/gtk.h>
 #include <webkit/webkit.h>
 
@@ -30,7 +31,7 @@
 #define WA_ICON_NAME  "io.github.shehawey.whatsapp"
 #define WA_TRAY_ICON  "io.github.shehawey.whatsapp-tray"
 #define WA_TITLE      "WhatsApp"
-#define WA_VERSION    "1.0.4"
+#define WA_VERSION    "1.0.5"
 #define WA_URL        "https://web.whatsapp.com/"
 
 /* Presenting as desktop Chrome is what gets the full web client. Setting this
@@ -60,20 +61,80 @@
 #define WA_DEFAULT_WIDTH   1200
 #define WA_DEFAULT_HEIGHT   800
 
-/* How many banner ids to remember for the click-to-open handler. */
-#define WA_RECENT_NOTIFICATIONS 8
-/* A repeat of the same summary and body inside this window is the second report
- * of one message, not a second message. */
-#define WA_NOTIFY_DEDUPE_US  (1500 * 1000)
+/* How many banners are tracked at once. The click handler has to recognise the
+ * ids still on screen, and messages are answered per conversation, so this is
+ * also how many chats can hold a banner of their own. */
+#define WA_BANNERS 8
+/* How long a banner id stays reusable. The shell destroys a transient
+ * notification the moment its banner hides, and an id it has forgotten simply
+ * makes a new banner, so this is housekeeping rather than a guard. */
+#define WA_BANNER_REUSE_US   (60000 * 1000)
+/* How long a banner may stay on screen before the client takes it down itself
+ * and posts the message again quietly. GNOME will not take it down on its own;
+ * banner_expire is where that story is told. */
+#define WA_BANNER_LIFETIME_S 12
+/* How many notification ids stay clickable. A banner is gone in seconds, but the
+ * entry it leaves in the notification centre can be clicked an hour later. */
+#define WA_CLICKABLE 16
+/* Notification pictures are written here, one file per distinct face. */
+#define WA_AVATAR_PREFIX "whatsapp-avatar-"
+/* Two reports of the same message from two different places -- the chat list
+ * watcher and the document title, say -- inside this window are one message.
+ * Two reports from the SAME place are two messages: somebody sending "tamam"
+ * twice in a row deserves two banners, and swallowing the second was a bug. */
+#define WA_NOTIFY_DEDUPE_US  (2500 * 1000)
 /* The document title is only consulted for a message the chat list missed, so it
  * waits this long for the watcher to speak first. */
 #define WA_TITLE_FALLBACK_US (2500 * 1000)
 /* Chats that were already unread when the client started are not news. WhatsApp
- * takes several seconds to sync them, and the title climbs from nothing to the
- * standing count as it does, which read as arrival after arrival. */
-#define WA_STARTUP_GRACE_US  (12000 * 1000)
+ * spends the best part of half a minute syncing them, rewriting row after row
+ * with messages that arrived while the client was not running, and the title
+ * climbs from nothing to the standing count as it does. Measured on a live
+ * launch: four conversations were announced fifteen seconds in, which is where
+ * this number comes from. The page-side watcher also refuses anything whose
+ * clock is not the current one, so this is the belt to that pair of braces. */
+#define WA_STARTUP_GRACE_US  (30000 * 1000)
 
+/* Where a notification came from. All the dedupe below needs to know is whether
+ * two reports of one message came from two different places. */
+typedef enum {
+    WA_SOURCE_PAGE,     /* WhatsApp Web raised it: the window is not in front */
+    WA_SOURCE_WATCHER,  /* the chat list watcher saw a message land */
+    WA_SOURCE_TITLE,    /* the unread count moved and the watcher had nothing */
+} WaSource;
+
+/* One live banner. Messages from the same conversation replace each other
+ * rather than queueing behind each other: GNOME shows one banner at a time,
+ * holds three in its queue and drops everything past that on the floor, so a
+ * burst of ten messages meant three banners spread over twelve seconds and
+ * seven that were never seen at all. A replacement is not a quiet one -- the
+ * shell clears the notification's `acknowledged` flag on every update, which
+ * puts the banner back on screen and rings the sound again. */
 typedef struct {
+    char               *chat;   /* who it is from: the key messages replace on */
+    char               *body;   /* what it said, for the quiet copy afterwards */
+    char               *image;  /* and the face that went with it */
+    guint32             id;     /* the id the daemon gave it, 0 while in flight */
+    gint64              at;     /* when it was raised */
+    guint               expiry; /* the timer that takes it down; see banner_expire */
+    WebKitNotification *page;   /* the page's own notification, when it is one */
+} WaBanner;
+
+/* A notification the user can still click, banner or notification-centre entry. */
+typedef struct {
+    guint32             id;
+    WebKitNotification *page;
+} WaClickable;
+
+/* Which banner a lifetime timer belongs to. The id rides along because the slot
+ * may have moved on to a newer message by the time it fires. */
+typedef struct {
+    struct WaAppTag *app;
+    int              slot;
+    guint32          id;
+} WaBannerExpiry;
+
+typedef struct WaAppTag {
     GtkApplication *app;
     GtkWindow      *window;
     WebKitWebView  *view;
@@ -81,18 +142,19 @@ typedef struct {
     char           *config_path;
     GFileMonitor   *debug_monitor;
     int             unread_chats;
-    guint32         notify_id;
-    /* Every banner gets an id of its own so each message alerts afresh; the
-     * click handler has to recognise the ones still on screen, hence a ring
-     * rather than a single value. */
-    guint32         recent_ids[WA_RECENT_NOTIFICATIONS];
-    int             recent_next;
+    WaBanner        banners[WA_BANNERS];
+    int             banner_next;
+    WaClickable     clickable[WA_CLICKABLE];
+    int             clickable_next;
     gboolean        notify_subscribed;
-    /* What was last announced, and when. The chat list and the document title
-     * can both report the same message, and this is what keeps that from
-     * showing up as two banners. */
+    /* Whether the notification daemon rings for a sound-name hint. GNOME's does
+     * and says so in GetCapabilities; one that does not is rung for here. */
+    gboolean        notify_has_sound;
+    /* What was last announced, from where, and when. Two places can report the
+     * same message, and this is what keeps that from showing up as two banners. */
     char           *last_summary;
     char           *last_body;
+    WaSource        last_source;
     gint64          last_notify_at;
     gint64          last_arrival_at;
     gint64          loaded_at;
@@ -264,53 +326,54 @@ apply_font(WebKitSettings *settings, WebKitUserContentManager *content,
      *   looks at the rest of the list, which was measured by asking for Naskh and
      *   for Kufi and getting Noto Sans Arabic both times.
      *
-     *   No line-height anywhere. WhatsApp's own line boxes are left exactly as
-     *   they are; see the note below for what changing them cost.
+     *   No line-height on the composer. Forcing one there was a mistake worth
+     *   recording: WhatsApp already sets 1.47em on it, and overriding that with
+     *   1.5 made the content one pixel taller than the box it sits in. A box with
+     *   one pixel of overflow is a scrollable box, so every keystroke scrolled the
+     *   caret back into view and the text twitched up and down -- which is exactly
+     *   the symptom the override was added to fix. Measured: scrollHeight exceeded
+     *   clientHeight by 1px on a three-line message, and zero without it. That is
+     *   why the rule below stops at [contenteditable].
      *
-     * The rules after the font stack are about Arabic, and about a clip being too
-     * tight rather than a font being wrong. WhatsApp gives its list and its
-     * bubbles line boxes of about 1.43em and cuts them off with overflow:hidden,
-     * which leaves 0.31em under the baseline; the bowls of ج ح خ reach 0.39em
-     * (measured through canvas ink extents at 100px), so their tails were shaved
-     * and "يعني" could read as "يعن ،". No @font-face descriptor helps, because
-     * WebKitGTK ignores local() sources and ascent-override alike.
+     * The rules after the font stack are about Arabic, and about a line box
+     * being too short rather than a font being wrong. WhatsApp gives its list and
+     * its bubbles line boxes of about 1.43em and clips them with overflow:hidden.
+     * The face WebKit falls back to for Arabic reserves 1.37em above the
+     * baseline on its own, so the bowl of a final ن or ي -- which hangs well
+     * below it -- was cut off, and the hook at the left end of each bowl was all
+     * that survived. That left a stray comma after every second word: "يعني"
+     * came out as "يعن ،". Nothing about it is the font's doing -- WhatsApp's own
+     * font stack clips identically, and so does every Arabic face installed here
+     * -- and no @font-face descriptor helps, because WebKitGTK ignores both
+     * local() sources and ascent-override. A taller line box is the one thing
+     * that fixes it. Measured on a 14px preview: clipped at 20px, 22px and 23.8px,
+     * clean at 24px, i.e. anything at or above about 1.6em. Text elements are
+     * named one by one rather than styling everything, so the surrounding layout
+     * keeps the heights WhatsApp gave it.
      *
-     * The fix is a taller clip, never a taller line: padding grows the box that
-     * overflow:hidden cuts against, and the negative margin hands the space
-     * straight back to the layout, so every row and every bubble keeps the exact
-     * height WhatsApp Web gives it. A line-height override was tried first and is
-     * the reason this note is long. It cured the clipping and broke the rhythm:
-     * a 1.7 line box against a 1.2 content box moves the baseline down by the
-     * half-leading, and since the strut comes from the Latin display font while
-     * the glyphs come from the Arabic fallback, Arabic and Latin in the same
-     * list settled at visibly different heights -- text "going up and down",
-     * which is not what the same page does in a browser. On the composer the
-     * same override cost a pixel of overflow, and a box with one pixel of
-     * overflow is a scrollable box, so every keystroke scrolled the caret back
-     * into view and the text twitched. Measured after this rule: scrollHeight
-     * equals clientHeight. */
+     * A version that left WhatsApp's line boxes alone and widened the CLIP
+     * instead -- padding-bottom with a matching negative margin on the elements
+     * that carry overflow:hidden -- shipped once and came straight back out. It
+     * can only reach boxes that can be named, and in the chat list that is
+     * div:has(> span[title]); a message bubble has no span[title] at all, so
+     * every Arabic bubble went back to being shorn while the list changed shape.
+     * The verdict on it was "you ruined the text, the one before was better", and
+     * the one before is what is written here. */
     char *css = g_strdup_printf(
         "* { font-family: \"%s\", system-ui, \"Noto Sans Arabic\", \"Noto Color Emoji\", "
         "\"Apple Color Emoji\", \"Segoe UI Emoji\", sans-serif !important; }"
-        /* The padding has to land on the box that actually clips, which is the
-           element AROUND the text rather than the text itself: WhatsApp gives
-           chat names and previews a span of their own and hangs overflow:hidden
-           on its parent, so padding on the span grew a box nothing was cut
-           against and the tails stayed shorn. :has() is what names that parent
-           without depending on WhatsApp's class names, which are obfuscated and
-           rotate every build; WebKitGTK 2.52 supports it (overflow-clip-margin,
-           which is what this would otherwise be a workaround for, it does not).
-
-           There are two boxes to clear, not one, which is why the first attempt
-           changed nothing at all: a preview is div > span[title] > span, and
-           both the div and the inner span carry overflow:hidden against a box
-           the height of one line. Every one of them is named. Measured live: the
-           boxes grow from 20px to 24.9px and the row they sit in stays 76px,
-           because the list fixes its own row heights. */
-        "div:has(> span[title]):not([contenteditable] *),"
-        "span[title] > span:not([contenteditable] *),"
-        /* The composer clips against itself and cannot be given a taller line
-           box either; it is the case this shape was found on. */
+        /* Chat names, previews and message text -- every place a message is read.
+           The composer is left alone on purpose; see above. */
+        "span[title]:not([contenteditable] *),"
+        "span[title]:not([contenteditable] *) *,"
+        "span[dir]:not([contenteditable] *),"
+        "span[dir]:not([contenteditable] *) * { line-height: 1.7 !important; }"
+        /* The composer clips the same way and cannot be given a taller line box,
+           so it is given a taller clip instead: padding grows the box that
+           overflow:hidden cuts against, and the negative margin hands the space
+           straight back to the layout. The line box is untouched, which is what
+           keeps the caret from twitching. Measured after: scrollHeight equals
+           clientHeight, where a line-height override left it one pixel over. */
         "[contenteditable=\"true\"]"
         "{ padding-bottom: 0.35em !important; margin-bottom: -0.35em !important; }",
         family);
@@ -576,7 +639,9 @@ push_focus_state(WaApp *self)
 static void
 on_window_state_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
 {
-    push_focus_state(user_data);
+    WaApp *self = user_data;
+
+    push_focus_state(self);
 }
 
 /* inject.js starts every page load with no idea where the focus is, so the state
@@ -961,23 +1026,26 @@ play_message_sound(void)
 }
 
 typedef struct {
-    WaApp *app;
-    int    count;
+    WaApp   *app;
+    WaSource source;
 } UnreadNotice;
 
-/* The page hands over the contact's picture as raw bytes; a notification icon has
- * to be a file, so it is written to the runtime directory.
+/* The page hands over the contact's picture as raw bytes; a notification icon
+ * has to be a file, so it is written to the runtime directory -- named after the
+ * picture itself.
  *
- * One name is not enough, which took two banners in the same millisecond to show:
- * both wrote that single file before either was drawn, and the second sender's
- * message went out under the first sender's face. The name rotates through as
- * many slots as there are remembered banners, so a picture stays put for as long
- * as the banner using it can still be on screen. They are small, there are eight,
- * and the runtime directory is cleared at logout. */
+ * The name used to rotate through eight slots, and that was a bug the user
+ * caught with a screenshot: a notification carries the PATH of its picture, and
+ * the shell reads that path lazily -- when it draws the banner, and again every
+ * time the notification centre redraws the entry. Nineteen messages in a burst
+ * went round the eight names twice, so files were rewritten under notifications
+ * that were still on screen and one sender's message appeared under another
+ * sender's face. A name taken from the bytes cannot collide: the same face is
+ * written once and every notification pointing at it stays correct for as long
+ * as it lives. */
 static char *
 avatar_path(const char *base64)
 {
-    static int slot = 0;
     gsize length = 0;
     guchar *bytes = g_base64_decode(base64, &length);
     if (!bytes || length == 0) {
@@ -985,13 +1053,16 @@ avatar_path(const char *base64)
         return NULL;
     }
 
-    char *name = g_strdup_printf("whatsapp-notify-avatar-%d", slot);
-    slot = (slot + 1) % WA_RECENT_NOTIFICATIONS;
+    char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, bytes, length);
+    char *name = g_strdup_printf("%s%.16s", WA_AVATAR_PREFIX, digest);
     char *path = g_build_filename(g_get_user_runtime_dir(), name, NULL);
+    g_free(digest);
     g_free(name);
-    gboolean written = g_file_set_contents(path, (const char *)bytes, length, NULL);
 
+    gboolean written = g_file_test(path, G_FILE_TEST_EXISTS) ||
+                       g_file_set_contents(path, (const char *)bytes, length, NULL);
     g_free(bytes);
+
     if (!written) {
         g_free(path);
         return NULL;
@@ -999,9 +1070,174 @@ avatar_path(const char *base64)
     return path;
 }
 
+/* The pictures of a whole session add up, and nothing else ever deletes them --
+ * a notification may still be pointing at one, so they cannot be cleaned up
+ * while the client runs. Startup is the safe moment: whatever is on screen then
+ * belongs to a client that is no longer running. */
+static void
+avatars_sweep(void)
+{
+    GDir *dir = g_dir_open(g_get_user_runtime_dir(), 0, NULL);
+    const char *name;
+    int removed = 0;
+
+    if (!dir)
+        return;
+
+    while ((name = g_dir_read_name(dir))) {
+        if (!g_str_has_prefix(name, WA_AVATAR_PREFIX))
+            continue;
+        char *path = g_build_filename(g_get_user_runtime_dir(), name, NULL);
+        if (g_remove(path) == 0)
+            removed++;
+        g_free(path);
+    }
+    g_dir_close(dir);
+
+    if (removed)
+        g_message("cleared %d notification picture%s from the last session",
+                  removed, removed == 1 ? "" : "s");
+}
+
 static void show_window(WaApp *self);
 
-/* Clicking the banner raises the window. */
+/* ----------------------------------------------------------------- banners */
+
+/* One Notify call, kept alive across the round trip so a refused id can be
+ * raised again as a fresh notification rather than dropped. */
+typedef struct {
+    WaApp              *app;
+    int                 slot;
+    char               *summary;
+    char               *body;
+    char               *image;
+    WebKitNotification *page;
+    guint32             replaced;
+    gboolean            quiet;   /* for the notification centre only: no banner */
+    gboolean            retried;
+} WaNotifyCall;
+
+static void
+notify_call_free(WaNotifyCall *call)
+{
+    g_clear_object(&call->page);
+    g_free(call->summary);
+    g_free(call->body);
+    g_free(call->image);
+    g_free(call);
+}
+
+static void notify_send(WaNotifyCall *call, guint32 replaces);
+
+/* Files what a banner is currently saying into the notification centre, and
+ * optionally takes the banner down with it.
+ *
+ * A LOW-urgency notification is filed by the shell without a banner and without
+ * a sound, which is exactly what a copy of something already announced should
+ * do. Every message passes through here exactly once: when the next message
+ * from the same conversation replaces its banner, or when its banner runs out
+ * of time. A banner the user dismissed or clicked is not archived -- they have
+ * seen it, and putting it back where they just cleared it is rude. */
+static void
+banner_archive(WaApp *self, WaBanner *slot, gboolean close_it)
+{
+    if (slot->expiry) {
+        g_source_remove(slot->expiry);
+        slot->expiry = 0;
+    }
+    if (slot->id == 0 || !slot->chat || !slot->body)
+        return;
+
+    WaNotifyCall *copy = g_new0(WaNotifyCall, 1);
+    copy->app     = self;
+    copy->slot    = (int)(slot - self->banners);
+    copy->summary = g_strdup(slot->chat);
+    copy->body    = g_strdup(slot->body);
+    copy->image   = g_strdup(slot->image);
+    copy->page    = slot->page ? g_object_ref(slot->page) : NULL;
+    copy->quiet   = TRUE;
+    notify_send(copy, 0);
+
+    if (!close_it)
+        return;
+
+    GDBusConnection *bus = g_application_get_dbus_connection(G_APPLICATION(self->app));
+    if (bus)
+        g_dbus_connection_call(
+            bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", "CloseNotification",
+            g_variant_new("(u)", slot->id), NULL,
+            G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+    slot->id = 0;
+}
+
+/* The banner this conversation is already holding, if it still has one. */
+static WaBanner *
+banner_for_chat(WaApp *self, const char *chat)
+{
+    const gint64 now = g_get_monotonic_time();
+
+    for (int i = 0; i < WA_BANNERS; i++)
+        if (self->banners[i].chat && g_strcmp0(self->banners[i].chat, chat) == 0 &&
+            now - self->banners[i].at < WA_BANNER_REUSE_US)
+            return &self->banners[i];
+    return NULL;
+}
+
+/* The slot the next banner for this conversation goes in: its own if it has one,
+ * otherwise the oldest. What the banner says is kept with it, because the
+ * message is filed in the notification centre when something replaces it. */
+static WaBanner *
+banner_take(WaApp *self, const char *chat, const char *body, const char *image,
+            WebKitNotification *page)
+{
+    WaBanner *slot = banner_for_chat(self, chat);
+
+    if (slot) {
+        /* Replacing this conversation's banner. What it says now goes into the
+         * notification centre first: three messages from one person leave three
+         * entries behind, and only the newest of them is ever on screen. */
+        banner_archive(self, slot, FALSE);
+    } else {
+        slot = &self->banners[self->banner_next];
+        self->banner_next = (self->banner_next + 1) % WA_BANNERS;
+        /* The conversation being turned out of this slot may still have a banner
+         * up; it is filed and closed rather than abandoned on screen. */
+        banner_archive(self, slot, TRUE);
+        g_free(slot->chat);
+        slot->chat = g_strdup(chat);
+        slot->id = 0;
+    }
+
+    g_free(slot->body);
+    g_free(slot->image);
+    slot->body  = g_strdup(body);
+    slot->image = g_strdup(image);
+
+    g_clear_object(&slot->page);
+    slot->page = page ? g_object_ref(page) : NULL;
+    slot->at = g_get_monotonic_time();
+    return slot;
+}
+
+/* Which notification a click belongs to. Banners come and go, and an entry left
+ * in the notification centre can be clicked hours later, so the ids are kept in
+ * a ring of their own rather than only on the conversation's slot. */
+static void
+clickable_add(WaApp *self, guint32 id, WebKitNotification *page)
+{
+    WaClickable *entry = &self->clickable[self->clickable_next];
+
+    self->clickable_next = (self->clickable_next + 1) % WA_CLICKABLE;
+    g_clear_object(&entry->page);
+    entry->id   = id;
+    entry->page = page ? g_object_ref(page) : NULL;
+}
+
+/* Clicking a notification raises the window -- and, when it came from one the
+ * page raised, hands the click back to the page, which opens the conversation
+ * it belongs to. Without that the window comes up on whatever was last read
+ * rather than on the message just announced. */
 static void
 on_notification_action(GDBusConnection *bus, const char *sender, const char *path,
                        const char *iface, const char *signal, GVariant *params,
@@ -1012,143 +1248,193 @@ on_notification_action(GDBusConnection *bus, const char *sender, const char *pat
     const char *action = NULL;
 
     g_variant_get(params, "(u&s)", &id, &action);
-    for (int i = 0; i < WA_RECENT_NOTIFICATIONS; i++)
-        if (id != 0 && id == self->recent_ids[i]) {
+    if (id == 0)
+        return;
+
+    for (int i = 0; i < WA_CLICKABLE; i++)
+        if (self->clickable[i].id == id) {
+            if (self->clickable[i].page)
+                webkit_notification_clicked(self->clickable[i].page);
             show_window(self);
             return;
         }
 }
 
+/* A notification the desktop has closed -- dismissed, clicked, or cleared out of
+ * the notification centre -- is finished with. Its id must not be offered back
+ * as something to replace, and it must not be filed away again behind the user. */
 static void
-on_notify_sent(GObject *source, GAsyncResult *result, gpointer user_data)
+on_notification_closed(GDBusConnection *bus, const char *sender, const char *path,
+                       const char *iface, const char *signal, GVariant *params,
+                       gpointer user_data)
+{
+    WaApp *self = user_data;
+    guint32 id = 0, reason = 0;
+
+    g_variant_get(params, "(uu)", &id, &reason);
+    if (id == 0)
+        return;
+
+    for (int i = 0; i < WA_BANNERS; i++)
+        if (self->banners[i].id == id) {
+            self->banners[i].id = 0;
+            if (self->banners[i].expiry) {
+                g_source_remove(self->banners[i].expiry);
+                self->banners[i].expiry = 0;
+            }
+        }
+}
+
+/* GNOME rings for the sound-name hint and says so; a desktop whose daemon does
+ * not advertise the capability is rung for by hand instead. */
+static void
+on_capabilities(GObject *source, GAsyncResult *result, gpointer user_data)
 {
     WaApp *self = user_data;
     GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, NULL);
+    if (!reply)
+        return;
 
-    if (reply) {
-        g_variant_get(reply, "(u)", &self->notify_id);
-        self->recent_ids[self->recent_next] = self->notify_id;
-        self->recent_next = (self->recent_next + 1) % WA_RECENT_NOTIFICATIONS;
-        g_variant_unref(reply);
-    }
-}
+    GVariantIter *iter = NULL;
+    const char *capability = NULL;
+    gboolean sound = FALSE;
 
-static gboolean send_desktop_notification(WaApp *self, const char *summary,
-                                          const char *body, const char *image);
+    g_variant_get(reply, "(as)", &iter);
+    while (iter && g_variant_iter_next(iter, "&s", &capability))
+        if (g_strcmp0(capability, "sound") == 0)
+            sound = TRUE;
+    if (iter)
+        g_variant_iter_free(iter);
+    g_variant_unref(reply);
 
-/* The same message can reach this point twice: the chat list watcher reports
- * every arrival, and the document title reports the first one in a chat that the
- * watcher could not see because its row had not been rendered yet. Rather than
- * order the two, the pair that would be printed on the banner is compared -- two
- * different messages a second apart still get a banner each, which is the whole
- * point of the change, while one message reported twice gets one. */
-static gboolean
-notification_is_repeat(WaApp *self, const char *summary, const char *body)
-{
-    const gint64 now = g_get_monotonic_time();
-    const gboolean same = g_strcmp0(self->last_summary, summary) == 0 &&
-                          g_strcmp0(self->last_body, body) == 0;
-
-    if (same && now - self->last_notify_at < WA_NOTIFY_DEDUPE_US)
-        return TRUE;
-
-    g_free(self->last_summary);
-    g_free(self->last_body);
-    self->last_summary  = g_strdup(summary);
-    self->last_body     = g_strdup(body);
-    self->last_notify_at = now;
-    return FALSE;
+    self->notify_has_sound = sound;
+    g_message("notification sound: %s", sound ? "the desktop rings for us" : "played here");
 }
 
 static void
-notify_unread(WaApp *self, int count, const char *chat, const char *sender,
-              const char *message, const char *avatar)
+notify_subscribe(WaApp *self, GDBusConnection *bus)
 {
-    char *image = avatar ? avatar_path(avatar) : NULL;
-    char *line = NULL;
-
-    if (message && sender)
-        line = g_strdup_printf("%s: %s", sender, message);
-    else if (message)
-        line = g_strdup(message);
-    else if (count == 1)
-        line = g_strdup("You have a new message");
-    else
-        line = g_strdup_printf("You have %d unread chats", count);
-
-    if (notification_is_repeat(self, chat ? chat : WA_TITLE, line)) {
-        g_message("notification skipped: the same message was just announced");
-        g_free(line);
-        g_free(image);
+    if (self->notify_subscribed)
         return;
-    }
+    self->notify_subscribed = TRUE;
+    /* Assumed until the daemon answers, so a slow reply cannot ring twice. */
+    self->notify_has_sound = TRUE;
 
-    if (send_desktop_notification(self, chat ? chat : WA_TITLE, line, image)) {
-        g_free(line);
-        g_free(image);
-        return;
-    }
-    g_free(line);
-    g_free(image);
-
-    /* Who it is goes in the title and what they said in the body, the way every
-     * other messaging app on the desktop does it. */
-    GNotification *note = g_notification_new(chat ? chat : WA_TITLE);
-
-    if (message && sender) {
-        char *body = g_strdup_printf("%s: %s", sender, message);
-        g_notification_set_body(note, body);
-        g_free(body);
-    } else if (message)
-        g_notification_set_body(note, message);
-    else if (count == 1)
-        g_notification_set_body(note, "You have a new message");
-    else {
-        char *body = g_strdup_printf("You have %d unread chats", count);
-        g_notification_set_body(note, body);
-        g_free(body);
-    }
-
-    GIcon *icon = g_themed_icon_new(WA_ICON_NAME);
-    g_notification_set_icon(note, icon);
-    g_notification_set_default_action(note, "app.present");
-    g_application_send_notification(G_APPLICATION(self->app), "unread", note);
-    play_message_sound();
-
-    g_object_unref(icon);
-    g_object_unref(note);
+    g_dbus_connection_signal_subscribe(
+        bus, "org.freedesktop.Notifications", "org.freedesktop.Notifications",
+        "ActionInvoked", "/org/freedesktop/Notifications", NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE, on_notification_action, self, NULL);
+    g_dbus_connection_signal_subscribe(
+        bus, "org.freedesktop.Notifications", "org.freedesktop.Notifications",
+        "NotificationClosed", "/org/freedesktop/Notifications", NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE, on_notification_closed, self, NULL);
+    g_dbus_connection_call(
+        bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "GetCapabilities", NULL,
+        G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL,
+        on_capabilities, self);
 }
 
-/* The desktop's own notification interface rather than GNotification, for two
- * things GNotification cannot express:
+/* Takes a banner down when the desktop will not, and leaves the message behind
+ * in the notification centre.
  *
- *   transient. Without it the shell keeps every banner in the message tray, and
- *   Dash to Panel adds those pending notifications to the launcher badge on top
- *   of the unread count -- one message showed up as two.
- *
- *   sound-name. GNotification is silent, and the tone this replaces was the one
- *   WhatsApp Web used to play for itself back when the page was told it was
- *   permanently unfocused. The daemon here advertises the "sound" capability.
- *
- * Each message is announced under a new id. Replacing the previous banner was
- * quieter, and quiet was the bug: the shell neither re-alerts nor rings for a
- * replacement, so the second and third message of a burst arrived in silence
- * behind the first one's banner. Nothing piles up in the tray regardless -- that
- * is what the transient hint above is for. */
+ * GNOME reads the expire_timeout of a notification and throws it away: a banner
+ * comes down when the user has been active AND the pointer is not resting on it,
+ * and until then it stays. That is a fine policy for one notification and a trap
+ * for a messenger, because the shell shows one banner at a time, queues three
+ * behind it and drops everything after that on the floor -- so one banner parked
+ * under an idle mouse pointer silently swallows every message that follows,
+ * sound and all. Measured on this desktop: with one of ours stuck, six
+ * notifications in a row produced no banner and no sound, including one sent at
+ * CRITICAL urgency; the moment it went away, the next one rang. */
 static gboolean
-send_desktop_notification(WaApp *self, const char *summary, const char *body,
-                          const char *image)
+banner_expire(gpointer user_data)
 {
-    GDBusConnection *bus = g_application_get_dbus_connection(G_APPLICATION(self->app));
-    if (!bus)
-        return FALSE;
+    WaBannerExpiry *expiry = user_data;
+    WaApp *self = expiry->app;
+    WaBanner *slot = &self->banners[expiry->slot];
 
-    if (!self->notify_subscribed) {
-        g_dbus_connection_signal_subscribe(
-            bus, "org.freedesktop.Notifications", "org.freedesktop.Notifications",
-            "ActionInvoked", "/org/freedesktop/Notifications", NULL,
-            G_DBUS_SIGNAL_FLAGS_NONE, on_notification_action, self, NULL);
-        self->notify_subscribed = TRUE;
+    slot->expiry = 0;
+
+    /* A different id in the slot means this banner is already gone -- clicked,
+     * dismissed, or replaced -- and the id now belongs to somebody else's
+     * notification, which is not ours to close. */
+    if (slot->id != expiry->id || slot->id == 0)
+        return G_SOURCE_REMOVE;
+
+    g_message("banner taken down after %ds; %s keeps its place in the notification centre",
+              WA_BANNER_LIFETIME_S, slot->chat ? slot->chat : WA_TITLE);
+    banner_archive(self, slot, TRUE);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+on_notify_sent(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    WaNotifyCall *call = user_data;
+    WaApp *self = call->app;
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+
+    if (reply) {
+        guint32 id = 0;
+        g_variant_get(reply, "(u)", &id);
+        g_variant_unref(reply);
+        clickable_add(self, id, call->page);
+
+        /* The quiet copy is an entry in the notification centre and nothing
+         * more: there is no banner on it to take down, and the conversation's
+         * next message must start a banner of its own rather than replace it --
+         * which is what leaves one entry behind per message. */
+        if (!call->quiet) {
+            WaBanner *slot = &self->banners[call->slot];
+            slot->id = id;
+            if (slot->expiry)
+                g_source_remove(slot->expiry);
+
+            WaBannerExpiry *expiry = g_new0(WaBannerExpiry, 1);
+            expiry->app  = self;
+            expiry->slot = call->slot;
+            expiry->id   = id;
+            slot->expiry = g_timeout_add_seconds_full(G_PRIORITY_DEFAULT, WA_BANNER_LIFETIME_S,
+                                                      banner_expire, expiry, g_free);
+        }
+        notify_call_free(call);
+        return;
+    }
+
+    /* A daemon that has handed the id on, or forgotten it, answers "Invalid
+     * notification ID". Leaving it at that would take every later message from
+     * this conversation with it, since the same id would be offered again. */
+    g_message("notification refused: %s%s", error ? error->message : "unknown",
+              call->replaced && !call->retried ? " -- raising it fresh" : "");
+    g_clear_error(&error);
+    if (!call->quiet)
+        self->banners[call->slot].id = 0;
+
+    if (call->replaced && !call->retried) {
+        call->retried = TRUE;
+        notify_send(call, 0);
+        return;
+    }
+    notify_call_free(call);
+}
+
+/* The desktop's own notification interface rather than GNotification, for the
+ * hints GNotification cannot express: sound-name, which is what rings (a
+ * GNotification is silent), the urgency that tells a quiet copy from a banner,
+ * and the picture of whoever sent the message.
+ *
+ * Notifications are deliberately NOT transient: they stay in the notification
+ * centre after the banner has gone, which is where the user goes looking for a
+ * message they missed. */
+static void
+notify_send(WaNotifyCall *call, guint32 replaces)
+{
+    GDBusConnection *bus = g_application_get_dbus_connection(G_APPLICATION(call->app->app));
+    if (!bus) {
+        notify_call_free(call);
+        return;
     }
 
     GVariantBuilder actions;
@@ -1158,34 +1444,215 @@ send_desktop_notification(WaApp *self, const char *summary, const char *body,
 
     GVariantBuilder hints;
     g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
-    g_variant_builder_add(&hints, "{sv}", "transient", g_variant_new_boolean(TRUE));
     g_variant_builder_add(&hints, "{sv}", "desktop-entry", g_variant_new_string(WA_APP_ID));
-    g_variant_builder_add(&hints, "{sv}", "sound-name", g_variant_new_string("message-new-instant"));
-    if (image)
-        g_variant_builder_add(&hints, "{sv}", "image-path", g_variant_new_string(image));
+    g_variant_builder_add(&hints, "{sv}", "category", g_variant_new_string("im.received"));
+    g_variant_builder_add(&hints, "{sv}", "urgency", g_variant_new_byte(call->quiet ? 0 : 1));
+    if (!call->quiet)
+        g_variant_builder_add(&hints, "{sv}", "sound-name",
+                              g_variant_new_string("message-new-instant"));
+    if (call->image)
+        g_variant_builder_add(&hints, "{sv}", "image-path", g_variant_new_string(call->image));
 
-    g_message("notification: %s -- %s", summary ? summary : "", body ? body : "");
+    call->replaced = replaces;
     g_dbus_connection_call(
         bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
         "org.freedesktop.Notifications", "Notify",
-        g_variant_new("(susssasa{sv}i)", WA_TITLE, 0,
-                      image ? image : WA_ICON_NAME, summary, body,
+        g_variant_new("(susssasa{sv}i)", WA_TITLE, replaces,
+                      call->image ? call->image : WA_ICON_NAME, call->summary, call->body,
                       &actions, &hints, -1),
         G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL,
-        on_notify_sent, self);
+        on_notify_sent, call);
+}
+
+/* Where GNotification is all there is -- no session bus of our own -- which in
+ * practice means a desktop this client was never built for. Silent, and without
+ * a picture, but it is a message the user would otherwise never see. */
+static void
+notify_through_gio(WaApp *self, const char *summary, const char *body)
+{
+    GNotification *note = g_notification_new(summary);
+    GIcon *icon = g_themed_icon_new(WA_ICON_NAME);
+
+    g_notification_set_body(note, body);
+    g_notification_set_icon(note, icon);
+    g_notification_set_default_action(note, "app.present");
+    g_application_send_notification(G_APPLICATION(self->app), "unread", note);
+    play_message_sound();
+
+    g_object_unref(icon);
+    g_object_unref(note);
+}
+
+/* The same message can reach this point twice: the chat list watcher reports
+ * every arrival, and the document title reports the first one in a chat whose
+ * row the watcher could not see. Two reports from two different places are one
+ * message; two from the same place are two messages, and collapsing those is
+ * what left the second and third message of a burst unannounced. */
+static gboolean
+notification_is_repeat(WaApp *self, const char *summary, const char *body, WaSource source)
+{
+    const gint64 now = g_get_monotonic_time();
+    const gboolean same = g_strcmp0(self->last_summary, summary) == 0 &&
+                          g_strcmp0(self->last_body, body) == 0;
+    const gboolean repeat = same && source != self->last_source &&
+                            now - self->last_notify_at < WA_NOTIFY_DEDUPE_US;
+
+    g_free(self->last_summary);
+    g_free(self->last_body);
+    self->last_summary   = g_strdup(summary);
+    self->last_body      = g_strdup(body);
+    self->last_source    = source;
+    self->last_notify_at = now;
+    return repeat;
+}
+
+/* Every banner in the client comes through here, wherever it was decided. */
+static void
+wa_notify(WaApp *self, const char *chat, const char *body, const char *image,
+          WebKitNotification *page, WaSource source)
+{
+    const char *summary = (chat && *chat) ? chat : WA_TITLE;
+
+    /* Never a banner with nothing to say. "You have a new message" under no
+     * sender and no text is what every phantom looked like, and a banner the
+     * client cannot fill in is one the user cannot act on either. */
+    if (!body || !*body) {
+        g_message("notification skipped: nothing to say");
+        return;
+    }
+    if (notification_is_repeat(self, summary, body, source)) {
+        g_message("notification skipped: just announced from elsewhere");
+        return;
+    }
+
+    GDBusConnection *bus = g_application_get_dbus_connection(G_APPLICATION(self->app));
+    if (!bus) {
+        notify_through_gio(self, summary, body);
+        return;
+    }
+    notify_subscribe(self, bus);
+
+    WaBanner *slot = banner_take(self, summary, body, image, page);
+    WaNotifyCall *call = g_new0(WaNotifyCall, 1);
+    call->app     = self;
+    call->slot    = (int)(slot - self->banners);
+    call->summary = g_strdup(summary);
+    call->body    = g_strdup(body);
+    call->image   = g_strdup(image);
+    call->page    = page ? g_object_ref(page) : NULL;
+
+    g_message("notification: %s -- %s", summary, body);
+    notify_send(call, slot->id);
+
+    if (!self->notify_has_sound)
+        play_message_sound();
+}
+
+/* --------------------------------------------- notifications the page raises */
+
+typedef struct {
+    WaApp              *app;
+    WebKitNotification *note;
+} PageNotice;
+
+/* WhatsApp Web raises its own notification whenever it believes the window is
+ * not in front, and it is the better judge by far: it knows the sender, the
+ * text, whether the chat is muted, and that what just landed is a message
+ * rather than a typing indicator or something the user sent from their phone.
+ * What it cannot do is dress it -- WebKit's default handler shows a silent
+ * banner that stays in the tray -- so the decision is left to the page and the
+ * banner is raised here, with a sound, a face and a click that opens the chat. */
+static void
+on_page_avatar(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    PageNotice *notice = user_data;
+    JSCValue *value = webkit_web_view_call_async_javascript_function_finish(
+        WEBKIT_WEB_VIEW(source), result, NULL);
+    char *image = NULL;
+
+    if (value) {
+        char *b64 = jsc_value_to_string(value);
+        if (b64 && *b64 && !g_str_equal(b64, "undefined") && !g_str_equal(b64, "null"))
+            image = avatar_path(b64);
+        g_free(b64);
+        g_object_unref(value);
+    }
+
+    wa_notify(notice->app,
+              webkit_notification_get_title(notice->note),
+              webkit_notification_get_body(notice->note),
+              image, notice->note, WA_SOURCE_PAGE);
+
+    g_free(image);
+    g_object_unref(notice->note);
+    g_free(notice);
+}
+
+static gboolean
+on_show_notification(WebKitWebView *view, WebKitNotification *note, gpointer user_data)
+{
+    WaApp *self = user_data;
+    const char *title = webkit_notification_get_title(note);
+
+    PageNotice *notice = g_new0(PageNotice, 1);
+    notice->app  = self;
+    notice->note = g_object_ref(note);
+
+    /* A WebKitNotification carries text and nothing else, so the picture is
+     * fetched by name from the chat list. The lookup answers an empty string
+     * when it cannot find the row or the fetch takes too long, and the banner
+     * goes out under the app icon instead of waiting on it. */
+    GVariantBuilder args;
+    g_variant_builder_init(&args, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&args, "{sv}", "name", g_variant_new_string(title ? title : ""));
+    GVariant *arguments = g_variant_ref_sink(g_variant_builder_end(&args));
+
+    webkit_web_view_call_async_javascript_function(
+        view, "return window.__whatsappAvatarFor ? window.__whatsappAvatarFor(name) : '';",
+        -1, arguments, NULL, NULL, NULL, on_page_avatar, notice);
+    g_variant_unref(arguments);
+
+    return TRUE;   /* raised here, so WebKit must not raise it as well */
+}
+
+/* --------------------------------------- notifications the chat list decides */
+
+/* Whether a banner is this client's to raise at all. While the window is away
+ * the page raises its own and on_show_notification dresses it; the watcher has
+ * to stay out of that, or one message arrives twice.
+ *
+ * The one grace period left is the unread backlog syncing in after a cold start.
+ * There was a second, over the moment the window came back from the tray, and it
+ * had to go: it swallowed a whole burst of group messages during a live test,
+ * because switching windows restamped it every few seconds. What it guarded
+ * against -- the list rewriting itself on a re-render -- is the page-side
+ * freshness test's job, and that one cannot mistake a rewrite for a message. */
+static gboolean
+banners_are_ours(WaApp *self)
+{
+    const gint64 now = g_get_monotonic_time();
+
+    if (!self->window || !gtk_widget_get_visible(GTK_WIDGET(self->window)) ||
+        !gtk_window_is_active(self->window))
+        return FALSE;
+    if (now - self->loaded_at < WA_STARTUP_GRACE_US) {
+        g_message("notification skipped: the client is still syncing");
+        return FALSE;
+    }
     return TRUE;
 }
 
 /* "open" is the page saying the message landed in the conversation already on
  * screen. Nothing is raised for that: the user is reading it as it arrives, and
- * WhatsApp plays its own tone, which is the whole of what a notification would
- * add. Banners are for the chats the user is not looking at. */
+ * WhatsApp plays its own arrival tone, which is the whole of what a notification
+ * would add. Banners are for the chats the user is not looking at. */
 static void
 on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
 {
     UnreadNotice *notice = user_data;
+    GError *error = NULL;
     JSCValue *value = webkit_web_view_call_async_javascript_function_finish(
-        WEBKIT_WEB_VIEW(source), result, NULL);
+        WEBKIT_WEB_VIEW(source), result, &error);
 
     char *chat = NULL, *sender = NULL, *message = NULL, *avatar = NULL, **parts = NULL;
     gboolean on_screen = FALSE;
@@ -1203,12 +1670,27 @@ on_unread_described(GObject *source, GAsyncResult *result, gpointer user_data)
         }
         g_free(payload);
         g_object_unref(value);
+    } else {
+        g_message("could not ask the page what arrived: %s",
+                  error ? error->message : "unknown");
+        g_clear_error(&error);
     }
 
-    if (on_screen)
+    if (on_screen) {
         g_message("notification skipped: the message is in the chat on screen");
-    else
-        notify_unread(notice->app, notice->count, chat, sender, message, avatar);
+    } else if (!chat || !message) {
+        /* The list moved but the page cannot say what moved it. Whatever it was
+         * -- a row mid-render, a reaction, a chat being read somewhere else --
+         * it is not something to put a banner over. */
+        g_message("notification skipped: nothing the page could name");
+    } else {
+        char *image = avatar ? avatar_path(avatar) : NULL;
+        char *line  = sender ? g_strdup_printf("%s: %s", sender, message)
+                             : g_strdup(message);
+        wa_notify(notice->app, chat, line, image, NULL, notice->source);
+        g_free(line);
+        g_free(image);
+    }
 
     g_strfreev(parts);
     g_free(notice);
@@ -1235,27 +1717,19 @@ describe_then_notify(gpointer user_data)
 /* The chat list watcher nudges us here for every message it sees land, which is
  * what makes a banner per message possible at all. The document title cannot do
  * that job: its number counts unread CHATS, so the second and third message from
- * one person leave "(1) WhatsApp" exactly as it was and nothing fired.
- *
- * Only while the window is in front, as before -- WhatsApp Web raises its own
- * notifications when it believes it is not, and two banners for one message is
- * worse than the bug this fixes. */
+ * one person leave "(1) WhatsApp" exactly as it was and nothing fires. */
 static void
 on_page_event(WebKitUserContentManager *manager, JSCValue *value, gpointer user_data)
 {
     WaApp *self = user_data;
     char *text = jsc_value_to_string(value);
 
-    const gint64 now = g_get_monotonic_time();
-    if (g_strcmp0(text, "arrival") == 0 && self->window &&
-        gtk_widget_get_visible(GTK_WIDGET(self->window)) &&
-        gtk_window_is_active(self->window) &&
-        now - self->loaded_at > WA_STARTUP_GRACE_US) {
-        self->last_arrival_at = now;
+    if (g_strcmp0(text, "arrival") == 0 && banners_are_ours(self)) {
+        self->last_arrival_at = g_get_monotonic_time();
 
         UnreadNotice *notice = g_new0(UnreadNotice, 1);
-        notice->app = self;
-        notice->count = self->unread_chats > 0 ? self->unread_chats : 1;
+        notice->app    = self;
+        notice->source = WA_SOURCE_WATCHER;
         g_timeout_add(250, describe_then_notify, notice);
     }
     g_free(text);
@@ -1284,14 +1758,12 @@ on_title_changed(GObject *object, GParamSpec *pspec, gpointer user_data)
      * the top. The count rises all the same. Anything the watcher already
      * announced within the last couple of seconds is left alone. */
     const gint64 now = g_get_monotonic_time();
-    if (chats > self->unread_chats && self->window &&
-        gtk_widget_get_visible(GTK_WIDGET(self->window)) &&
-        gtk_window_is_active(self->window) &&
+    if (chats > self->unread_chats &&
         now - self->last_arrival_at > WA_TITLE_FALLBACK_US &&
-        now - self->loaded_at > WA_STARTUP_GRACE_US) {
+        banners_are_ours(self)) {
         UnreadNotice *notice = g_new0(UnreadNotice, 1);
-        notice->app = self;
-        notice->count = chats;
+        notice->app    = self;
+        notice->source = WA_SOURCE_TITLE;
         g_timeout_add(250, describe_then_notify, notice);
     }
     self->unread_chats = chats;
@@ -1438,6 +1910,11 @@ build_window(WaApp *self)
     allow_notifications(self->view);
     g_signal_connect(self->view, "notify::title",
                      G_CALLBACK(on_title_changed), self);
+    /* Every notification WhatsApp Web raises for itself is dressed and sent on
+     * by the app instead -- WebKit's own handler shows a silent banner that
+     * lingers in the tray, and it cannot say which chat a click should open. */
+    g_signal_connect(self->view, "show-notification",
+                     G_CALLBACK(on_show_notification), self);
     g_signal_connect(self->view, "create", G_CALLBACK(on_create_web_view), self);
     g_signal_connect(self->view, "decide-policy", G_CALLBACK(on_decide_policy), self);
     g_signal_connect(self->view, "load-changed", G_CALLBACK(on_load_changed), self);
@@ -1460,6 +1937,7 @@ build_window(WaApp *self)
     gtk_widget_add_controller(GTK_WIDGET(self->window), keys);
 
     watch_debug_file(self);
+    avatars_sweep();
 
     webkit_web_view_load_uri(self->view, WA_URL);
 }

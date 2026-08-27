@@ -99,19 +99,43 @@
     log('could not instrument notifications: ' + err.message);
   }
 
+  /* ------------------------------------------------------------------ focus */
+
+  /* Focus is pushed in by the app, because WebKit gets it wrong here: a WebView
+     in a window hidden in the tray still reports itself focused. WhatsApp reads
+     document.hasFocus() both to decide whether to raise a notification and to
+     decide whether the chat on screen has been read, so the answer has to be the
+     truth -- pinning it to false once produced notifications and cost the user
+     their read receipts at the same time.
+
+     It is also the line the whole notification story is divided along. While the
+     page believes itself unfocused it raises its own notifications, which the app
+     intercepts and dresses; the watcher below then has nothing to do, and does
+     nothing, because two paths reporting one message is two banners. */
+  let focused = false;
+  try {
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => focused });
+  } catch (err) {
+    log('could not override document.hasFocus: ' + err.message);
+  }
+
+  window.__whatsappSetFocus = state => {
+    state = !!state;
+    if (state === focused) return 'unchanged';
+    focused = state;
+    // WhatsApp acts on the events, not on a poll of hasFocus().
+    window.dispatchEvent(new Event(state ? 'focus' : 'blur'));
+    document.dispatchEvent(new Event(state ? 'focus' : 'blur'));
+    return state ? 'focused' : 'blurred';
+  };
+
   /* ------------------------------------------------------- what just arrived */
 
-  /* Describe the chat behind the newest message, so a notification can say who
-     sent it and what they said. Two facts from the live DOM drive this: a chat
-     list row is [role="row"] under #pane-side, and it carries two span[title]
-     elements -- the chat name first, the message preview second. A new message
-     moves its chat to the top of the list, so the top row is the fallback when
-     no row carries an unread badge.
-
-     Nothing here lies to the page: an earlier attempt forced document.hasFocus()
-     to false, which did make WhatsApp raise notifications while the window was
-     focused -- and also convinced it the user was not looking, so opening a chat
-     never marked it read. */
+  /* Everything below only matters while the window is in front. WhatsApp Web
+     stays silent then -- it can see it has the user's attention -- so a message
+     landing in a conversation the user is not looking at would pass unannounced.
+     The chat list is watched for it: WhatsApp rewrites a row the moment a message
+     lands there, so the row that changed is the chat the message went to. */
 
   /* The chat on screen. WhatsApp marks its row aria-selected="true", which beats
      reading the conversation header: the header of a community announcement group
@@ -126,19 +150,11 @@
      which have to come off before anything is compared or displayed. */
   const strip = t => (t || '').replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '').trim();
 
-  /* Which chat a message actually landed in.
-
-     The document title only says how many chats are unread, so a notification
-     built on it alone had to guess at the rest, and the guess -- the row wearing
-     an unread badge -- was wrong in the one case that matters: a message arriving
-     in the chat already on screen is read instantly and never wears a badge, so
-     the app described some other conversation and put an old message on screen
-     under a fresh banner.
-
-     WhatsApp rewrites a chat's preview the moment a message lands there, so
-     watching the list says exactly which row changed. Arrivals are queued and the
-     app collects them when it raises a notification -- pushing them would race the
-     title, which is the bug this replaces. */
+  const titlesIn = row => [...row.querySelectorAll('span[title]')];
+  const nameOf = row => {
+    const first = titlesIn(row)[0];
+    return strip(first && first.getAttribute('title'));
+  };
 
   /* A message of our own moves a chat to the top of the list and rewrites its
      preview exactly the way an incoming one does, so without this a message sent
@@ -164,9 +180,28 @@
   };
   const isOutgoing = el => iconNames(el).some(n => OUTGOING_ICON.test(n));
 
-  /* The app is told that something landed; it then asks what, the same way it
-     always has. Only the nudge is pushed -- pushing the description is the race
-     that used to make every banner read "You have a new message". */
+  /* WhatsApp leaves muted chats out of its own notifications, so this client
+     does too. */
+  const MUTED_LABEL = /muted|\u0645\u0643\u062a\u0648\u0645|\u0643\u062a\u0645/i;
+  const isMuted = row => [...row.querySelectorAll('[aria-label]')]
+      .some(e => MUTED_LABEL.test(e.getAttribute('aria-label') || ''));
+
+  /* How many messages the row says are waiting. The pill carries the number in
+     its label ("3 unread messages"); a row with no pill is caught up. */
+  const UNREAD_LABEL = /unread|\u063a\u064a\u0631 \u0645\u0642\u0631\u0648\u0621/i;
+  const unreadCount = row => {
+    for (const el of row.querySelectorAll('[aria-label]')) {
+      const label = el.getAttribute('aria-label') || '';
+      if (!UNREAD_LABEL.test(label)) continue;
+      const digits = label.match(/\d+/);
+      return digits ? parseInt(digits[0], 10) : 1;
+    }
+    return 0;
+  };
+
+  /* The app is told that something landed; it then asks what. Only the nudge is
+     pushed -- pushing the description is the race that used to make every banner
+     read "You have a new message". */
   const ping = () => {
     try { window.webkit.messageHandlers.whatsappEvent.postMessage('arrival'); } catch (e) {}
   };
@@ -175,7 +210,7 @@
      same name -- this account has four such pairs, and keying by name made each
      scan read one row's preview as the other's, so every single pass reported an
      arrival that had not happened. */
-  const previews = new WeakMap();
+  const rowState = new WeakMap();
   const ARRIVAL_TTL_MS = 30000;
   /* The list does not arrive in one piece: rows appear, and then their previews,
      their badges and their timestamps fill in behind them. Every one of those is
@@ -197,17 +232,64 @@
   const TYPING_PREVIEW =
       /^(?:[^:]{1,40}:\s*)?(typing|recording(?: audio)?|\u064a\u0643\u062a\u0628|\u064a\u0633\u062c\u0644)\s*(?:\.{1,3}|\u2026)?$/i;
 
-  /* What is compared from pass to pass. The preview alone is not enough: a
-     second "tamam" under the first leaves it identical, and that message went
-     unnoticed and unannounced. The unread badge and the row's timestamp ride
-     along because WhatsApp bumps both for every single message. */
-  const signatureOf = (row, preview) => {
-    const badge = [...row.querySelectorAll('[aria-label]')]
-        .map(e => e.getAttribute('aria-label') || '')
-        .filter(l => /unread|\u063a\u064a\u0631 \u0645\u0642\u0631\u0648\u0621/i.test(l))
-        .join(',');
-    const when = ((row.innerText || '').match(/\b\d{1,2}:\d{2}(?:\s*[AP]M)?\b/) || [''])[0];
-    return preview + '\u0000' + badge + '\u0000' + when;
+  /* What is read off a row on every pass. Three things move when a message
+     lands, and it takes all three to catch every one: the preview, because that
+     is the message; the timestamp, because a second "tamam" under the first
+     leaves the preview identical and that message went unannounced; and the
+     unread count, because two identical messages inside the same minute move
+     nothing else at all. */
+  const readRow = row => {
+    const titles = titlesIn(row);
+    return {
+      name:    strip(titles[0] && titles[0].getAttribute('title')),
+      preview: strip(titles[1] && titles[1].getAttribute('title')),
+      badge:   unreadCount(row),
+      when:    ((row.innerText || '').match(/\b\d{1,2}:\d{2}(?:\s*[AP]M)?\b/) || [''])[0],
+    };
+  };
+
+  /* Whether the time a row shows is the time it is now. WhatsApp stamps a row
+     with the time of its last message, so a row rewritten by a sync -- which is
+     what the whole chat list does for half a minute after the client starts, and
+     again after the network comes back -- carries an old one. Four conversations
+     were announced fifteen seconds into a launch this way, and that is what "it
+     shows me phantom notifications when I open it" was.
+
+     Returns null rather than false when the format is not one this can read, so
+     a locale that writes its clock in digits the regex above cannot match falls
+     back to the unread count instead of going silent. */
+  const FRESH_MS = 3 * 60 * 1000;
+  const freshness = when => {
+    const m = /^(\d{1,2}):(\d{2})(?:\s*([AP])\.?M\.?)?$/i.exec(when || '');
+    if (!m) return null;
+
+    let hour = parseInt(m[1], 10);
+    if (m[3]) hour = (hour % 12) + (/p/i.test(m[3]) ? 12 : 0);
+
+    const now = new Date();
+    const stamp = new Date(now);
+    stamp.setHours(hour, parseInt(m[2], 10), 0, 0);
+
+    let age = now - stamp;
+    if (age < -FRESH_MS) age += 24 * 60 * 60 * 1000;   // the clock has just passed midnight
+    return age >= -FRESH_MS && age <= FRESH_MS;
+  };
+
+  /* Whether the difference between two readings of one row is a message landing.
+     Comparing the readings wholesale is what put phantom banners on screen: the
+     badge clears when a chat is read, so every conversation the user opened --
+     and the whole backlog clearing when the window came back from the tray --
+     looked exactly like an arrival. An unread count going DOWN is the user
+     catching up, and is never news; a row whose clock says half an hour ago is
+     WhatsApp rewriting it, not somebody writing to it. */
+  const isArrival = (before, now) => {
+    const changed = now.preview !== before.preview ||
+                    now.when !== before.when ||
+                    now.badge > before.badge;
+    if (!changed) return false;
+
+    const fresh = freshness(now.when);
+    return fresh === null ? now.badge > before.badge : fresh;
   };
 
   const scanList = () => {
@@ -215,46 +297,47 @@
     if (!pane) return;
 
     for (const row of pane.querySelectorAll('[role="row"]')) {
-      const titles = [...row.querySelectorAll('span[title]')];
-      if (!strip(titles[0] && titles[0].getAttribute('title'))) continue;
-      const preview = strip(titles[1] && titles[1].getAttribute('title'));
+      const now = readRow(row);
+      if (!now.name) continue;
 
-      const before = previews.get(row);
+      const before = rowState.get(row);
 
       /* Neither of these is a message, and both are skipped before the row's
-         signature is recorded, so the text that replaces them matches what was
-         there before and does not read as an arrival of its own. "typing..." is
-         what WhatsApp writes in the preview while the other side is still
-         writing -- it announced "Mega -- typing..." as though it were something
-         somebody had said -- and an empty preview is a row mid-render. */
-      if (TYPING_PREVIEW.test(preview)) continue;
-      if (!preview && before !== undefined) continue;
+         state is recorded, so the text that replaces them matches what was there
+         before and does not read as an arrival of its own. "typing..." is what
+         WhatsApp writes in the preview while the other side is still writing --
+         it announced "Mega -- typing..." as though it were something somebody
+         had said -- and an empty preview is a row mid-render. */
+      if (TYPING_PREVIEW.test(now.preview)) continue;
+      if (!now.preview && before !== undefined) continue;
 
-      const signature = signatureOf(row, preview);
-      previews.set(row, signature);
+      rowState.set(row, now);
 
       /* A row we are seeing for the first time is not news -- only one we
          already knew, whose message has since changed. */
-      if (!seeded || before === undefined || before === signature) continue;
+      if (!seeded || before === undefined) continue;
       if (Date.now() - seededAt < SETTLE_MS) continue;
-      /* WhatsApp leaves muted chats out of its own notifications. */
-      if ([...row.querySelectorAll('[aria-label]')]
-            .some(e => /muted|مكتوم|كتم/i.test(e.getAttribute('aria-label') || ''))) continue;
+      if (!isArrival(before, now)) continue;
+      if (isMuted(row)) continue;
       if (isOutgoing(row)) continue;
 
-      /* Queued per message rather than per chat: the app now asks once for each
-         one, and collapsing them here is what swallowed the second and third
-         message of a burst from the same person. */
-      arrivals.push({ row, at: Date.now() });
+      /* Nothing is queued while the window is away: WhatsApp raises its own
+         notification then, and the app dresses that one instead. A queue built
+         up in the background used to be handed over the moment the window came
+         back, and every message in it was announced a second time. */
+      if (!focused) continue;
+
+      /* Queued per message rather than per chat: the app asks once for each one,
+         and collapsing them here is what swallowed the second and third message
+         of a burst from the same person. */
+      arrivals.push({ row, name: now.name, preview: now.preview, at: Date.now() });
       ping();
     }
 
-    /* Anything the app never came to collect -- it only asks while its window is
-       in front -- goes stale rather than waiting to be reported as news. */
     const cutoff = Date.now() - ARRIVAL_TTL_MS;
-    arrivals = arrivals.filter(a => a.row.isConnected && a.at > cutoff);
-    /* Deep enough for a burst that the app has not caught up with yet; the app
-       asks once per message, so this is a backstop, not a queue depth. */
+    arrivals = arrivals.filter(a => a.at > cutoff);
+    /* Deep enough for a burst the app has not caught up with yet; it asks once
+       per message, so this is a backstop, not a queue depth. */
     if (arrivals.length > 16) arrivals = arrivals.slice(-16);
     if (!seeded) { seeded = true; seededAt = Date.now(); }
   };
@@ -279,46 +362,141 @@
   setInterval(watchList, 4000);
   addEventListener('load', watchList);
 
-  /* The contact's picture, as bytes the app can turn into a notification icon.
-     The <img> is already on screen but its canvas is tainted, so the bytes are
+  /* The row for a chat WhatsApp has re-rendered since. Rows are recycled freely,
+     and an arrival whose element was thrown away in the 250ms before the app
+     asked about it used to fall through to "nothing identified" -- which is what
+     raised a banner reading "You have a new message" over a conversation the user
+     was already reading. The message rides along with the name, so a chat that
+     shares its name with another is still told apart. */
+  const findRow = (name, preview) => {
+    const pane = document.querySelector('#pane-side');
+    for (const row of (pane ? pane.querySelectorAll('[role="row"]') : [])) {
+      const titles = titlesIn(row);
+      if (strip(titles[0] && titles[0].getAttribute('title')) !== name) continue;
+      if (preview && strip(titles[1] && titles[1].getAttribute('title')) !== preview) continue;
+      return row;
+    }
+    return null;
+  };
+
+  /* The text of the last message drawn in the conversation on screen. */
+  const lastOnScreen = () => {
+    const main = document.querySelector('#main');
+    const rows = main ? main.querySelectorAll('[role="row"]') : [];
+    const last = rows[rows.length - 1];
+    return last ? strip(last.innerText) : '';
+  };
+
+  /* Whether this row is the conversation the user is looking at. Element
+     identity answers it whenever the row survived; when WhatsApp recycled it the
+     name has to, and the name alone is not enough -- this account has four pairs
+     of chats that share one -- so the message has to be on screen as well. */
+  const isOpen = (row, preview) => {
+    const open = openRow();
+    if (!open) return false;
+    if (row === open || open.contains(row) || row.contains(open)) return true;
+
+    const name = nameOf(row);
+    if (!name || name !== nameOf(open)) return false;
+    const text = strip(preview).replace(/\u2026$/, '');
+    return !!text && lastOnScreen().indexOf(text) >= 0;
+  };
+
+  /* Pictures are fetched once per URL and kept. The same face comes back for
+     every message of a burst, and a network round trip in front of every banner
+     is a banner that arrives late. */
+  const avatars = new Map();
+  const AVATAR_MAX_BYTES = 200000;
+  const AVATAR_TIMEOUT_MS = 1200;
+
+  const bytesToBase64 = bytes => {
+    let binary = '';
+    /* In chunks: fromCharCode.apply over the whole array blows the argument
+       limit, and a character at a time over 200 KB is slow enough to be felt as
+       a stutter, since this runs on the page's own thread. */
+    for (let i = 0; i < bytes.length; i += 8192)
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return btoa(binary);
+  };
+
+  /* The <img> is already on screen but its canvas is tainted, so the bytes are
      re-fetched instead -- the CDN answers a plain fetch with CORS, verified
      against a live avatar (200 image/jpeg). */
-  const avatarOf = async row => {
-    const img = row.querySelector('img[src^="http"], img[src^="blob:"]');
-    if (!img || !img.src) return '';
+  const fetchAvatar = async src => {
+    if (avatars.has(src)) return avatars.get(src);
+
+    let encoded = '';
     try {
-      const r = await fetch(img.src);
-      if (!r.ok) return '';
-      const bytes = new Uint8Array(await r.arrayBuffer());
-      if (bytes.length > 400000) return '';
-      let bin = '';
-      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      return btoa(bin);
-    } catch (e) {
-      return '';
-    }
+      const response = await fetch(src);
+      if (response.ok) {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (bytes.length && bytes.length <= AVATAR_MAX_BYTES) encoded = bytesToBase64(bytes);
+      }
+    } catch (e) { /* offline, or the URL expired: the app icon will do */ }
+
+    if (avatars.size > 64) avatars.clear();
+    avatars.set(src, encoded);
+    return encoded;
+  };
+
+  /* A picture must never hold a notification up. Better plain than late. */
+  const avatarOf = async row => {
+    const img = row && row.querySelector('img[src^="http"], img[src^="blob:"]');
+    if (!img || !img.src) return '';
+    return Promise.race([
+      fetchAvatar(img.src),
+      new Promise(resolve => setTimeout(() => resolve(''), AVATAR_TIMEOUT_MS)),
+    ]);
+  };
+
+  /* Asked by name when the notification is one the page raised: a
+     WebKitNotification carries text and nothing else, and the app still wants the
+     sender's face on the banner. WhatsApp titles a group notification with the
+     group name and a direct one with the contact, so an exact match is tried
+     first and a containing one after it. */
+  window.__whatsappAvatarFor = async name => {
+    const wanted = strip(name);
+    if (!wanted) return '';
+
+    const pane = document.querySelector('#pane-side');
+    const rows = [...(pane ? pane.querySelectorAll('[role="row"]') : [])];
+    let match = rows.find(row => nameOf(row) === wanted);
+
+    if (!match)
+      match = rows.find(row => {
+        const rowName = nameOf(row);
+        return rowName.length > 2 &&
+               (wanted.indexOf(rowName) >= 0 || rowName.indexOf(wanted) >= 0);
+      });
+
+    return match ? avatarOf(match) : '';
   };
 
   /* Answers the app's one question at notification time: what just arrived, and
      was it the conversation already on screen? The reply is the chat, the sender,
      the message and the avatar joined by unit separators -- or the single word
-     "open", which means stay quiet. The user is looking straight at the message
-     and WhatsApp plays its own arrival tone for it, so a banner over the top of
-     the very chat it came from is noise. */
+     "open", which means stay quiet, or an empty string, which means there is
+     nothing to say and the app should say nothing. There is deliberately no
+     third answer: a banner whose text the app had to invent is the phantom this
+     client kept raising. */
   window.__whatsappDescribeUnread = async () => {
     scanList();                       // collect whatever the debounce still owes us
 
-    const open = openRow();
-
-    /* Oldest first, one per call. The app raises a banner for every message now,
-       so draining the queue for a single description would announce the newest
-       arrival and quietly discard the rest -- messages the user never saw. The
-       one that landed in the chat on screen still answers "open" when its turn
-       comes and is passed over there. */
+    /* Oldest first, one per call. The app raises a banner for every message, so
+       draining the queue for a single description would announce the newest
+       arrival and quietly discard the rest -- messages the user never saw. */
     const cutoff = Date.now() - ARRIVAL_TTL_MS;
-    arrivals = arrivals.filter(a => a.row.isConnected && a.at > cutoff);
-    const next = arrivals.shift();
-    let row = next ? next.row : null;
+    arrivals = arrivals.filter(a => a.at > cutoff);
+
+    let row = null, queued = null;
+    while (arrivals.length && !row) {
+      queued = arrivals.shift();
+      row = queued.row.isConnected ? queued.row : findRow(queued.name, queued.preview);
+    }
+    /* The message landed in the chat on screen: the user is reading it as it
+       arrives and WhatsApp plays its own tone, so a banner over the top of the
+       very conversation it came from is noise. */
+    if (row && isOpen(row, queued.preview)) return 'open';
 
     /* Nothing queued and the app still asked, which means the document title saw
        a chat go unread that the watcher never did: the list only renders the
@@ -326,30 +504,22 @@
        element we have no previous reading for. The topmost unread row is the one
        WhatsApp just moved up there. This is a guess, and it is confined to the
        case where there is nothing better -- the queue is what answers every
-       message from a chat already on the list, and "you have unread chats" is
-       what the app printed here before. */
+       message from a chat already on the list. */
     if (!row) {
       const pane = document.querySelector('#pane-side');
       for (const candidate of (pane ? pane.querySelectorAll('[role="row"]') : [])) {
-        const badge = [...candidate.querySelectorAll('[aria-label]')]
-            .some(e => /unread/i.test(e.getAttribute('aria-label') || ''));
-        if (!badge || candidate === open || isOutgoing(candidate)) continue;
+        if (!unreadCount(candidate)) continue;
+        if (isOpen(candidate, '') || isMuted(candidate) || isOutgoing(candidate)) continue;
         row = candidate;
         break;
       }
     }
 
-    /* Nothing changed and nothing unread: there is genuinely nothing to say, and
-       the app prints its own plain line rather than being handed a row picked at
-       random -- that is what used to put a message from an hour ago under a
-       banner announcing a new one. */
+    /* Nothing changed and nothing unread: there is genuinely nothing to say. */
     if (!row) return '';
-    if (row === open) return 'open';
 
-    const titles = [...row.querySelectorAll('span[title]')];
-    const name = strip(titles[0] && titles[0].getAttribute('title'));
-    const message = strip(titles[1] && titles[1].getAttribute('title'));
-    if (!name) return '';
+    const state = readRow(row);
+    if (!state.name || !state.preview) return '';
 
     /* In a group row the sender is its own element followed by a bare ":"
        element; a one-to-one row has neither. Verified against live rows: groups
@@ -361,30 +531,7 @@
     const sender = colon > 0 ? lines[colon - 1] : '';
 
     // The separator below cannot occur in a chat name or in a message.
-    return [name, sender, message, await avatarOf(row)].join('\u001f');
-  };
-
-  /* Focus is pushed in by the app, because WebKit gets it wrong here: a WebView
-     in a window hidden in the tray still reports itself focused. WhatsApp reads
-     document.hasFocus() both to decide whether to raise a notification and to
-     decide whether the chat on screen has been read, so the answer has to be the
-     truth -- pinning it to false once produced notifications and cost the user
-     their read receipts at the same time. */
-  let focused = false;
-  try {
-    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => focused });
-  } catch (err) {
-    log('could not override document.hasFocus: ' + err.message);
-  }
-
-  window.__whatsappSetFocus = state => {
-    state = !!state;
-    if (state === focused) return 'unchanged';
-    focused = state;
-    // WhatsApp acts on the events, not on a poll of hasFocus().
-    window.dispatchEvent(new Event(state ? 'focus' : 'blur'));
-    document.dispatchEvent(new Event(state ? 'focus' : 'blur'));
-    return state ? 'focused' : 'blurred';
+    return [state.name, sender, state.preview, await avatarOf(row)].join('\u001f');
   };
 
   /* Emoji are sprite sheets referenced from generated CSS, and each one is only
