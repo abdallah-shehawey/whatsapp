@@ -17,7 +17,7 @@ WebKit's usual fallback of inserting `<img src="blob:">` does not happen either,
 because WhatsApp's composer is plaintext-only, so there is nothing to scrape
 back out of the DOM. whatsapp never asks WebKit for the clipboard: it reads the
 image on the GTK side, where the data is plainly there, and hands the bytes to
-the page. Text paste is left on WebKit's native path, which works fine.
+the page. Text-only paste is left on WebKit's native path, which works fine. When a clipboard publishes an image together with auxiliary text or HTML formats, the image is preferred so WhatsApp receives a real media attachment that can be sent.
 
 **WhatsApp thought it was talking to Safari on a Mac**, offered a Mac download
 and registered the device as "Safari (Mac OS)". WebKitGTK ships site-specific

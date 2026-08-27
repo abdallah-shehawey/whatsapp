@@ -468,11 +468,13 @@ clipboard_has_image(GtkWidget *widget)
     return gdk_content_formats_contain_gtype(formats, GDK_TYPE_TEXTURE);
 }
 
-/* Intercept Ctrl+V only for a clipboard that holds an image and no text.
- * Rich-text copies often carry both, and there the user means the text -- the
- * page-side route below picks up anything this declines. */
+/* Intercept Ctrl+V whenever the clipboard offers an image. Some screenshot
+ * tools and browsers publish an image together with text/plain or text/html;
+ * treating those as text-only leaves WhatsApp with a pasted preview that is not
+ * a real media attachment, so the send action does nothing. Image data wins
+ * over the auxiliary text formats here. */
 static gboolean
-clipboard_holds_image_only(GtkWidget *widget)
+clipboard_holds_image(GtkWidget *widget)
 {
     GdkClipboard *clipboard = gtk_widget_get_clipboard(widget);
     GdkContentFormats *formats = gdk_clipboard_get_formats(clipboard);
@@ -485,13 +487,16 @@ clipboard_holds_image_only(GtkWidget *widget)
     g_message("paste: clipboard offers %s", offered);
     g_free(offered);
 
-    if (gdk_content_formats_contain_mime_type(formats, "text/plain") ||
-        gdk_content_formats_contain_mime_type(formats, "text/plain;charset=utf-8")) {
-        g_message("paste: text present, leaving it to WebKit");
-        return FALSE;
-    }
+    gboolean has_image = clipboard_has_image(widget);
+    gboolean has_text = gdk_content_formats_contain_mime_type(formats, "text/plain") ||
+                        gdk_content_formats_contain_mime_type(formats, "text/plain;charset=utf-8") ||
+                        gdk_content_formats_contain_mime_type(formats, "text/html");
+    if (has_image && has_text)
+        g_message("paste: image and text present, choosing the image attachment");
+    else if (has_text)
+        g_message("paste: text present without an image, leaving it to WebKit");
 
-    return clipboard_has_image(widget);
+    return has_image;
 }
 
 static void
@@ -624,7 +629,7 @@ on_key_pressed(GtkEventControllerKey *controller, guint keyval, guint keycode,
     case GDK_KEY_V:
         g_message("paste: Ctrl+V intercepted");
         /* Let text paste take WebKit's native path, which works fine. */
-        if (!clipboard_holds_image_only(GTK_WIDGET(self->window)))
+        if (!clipboard_holds_image(GTK_WIDGET(self->window)))
             return GDK_EVENT_PROPAGATE;
         paste_clipboard_image(self);
         return GDK_EVENT_STOP;
