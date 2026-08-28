@@ -1,6 +1,6 @@
 # whatsapp
 
-A small WhatsApp Web client for GTK4 + WebKitGTK 6. The binary is around 55 KB.
+A small WhatsApp Web client for GTK4 + WebKitGTK 6. The binary is around 120 KB.
 It loads `web.whatsapp.com`, so it is the same client WhatsApp serves to a
 browser — no reverse-engineered protocol, and nothing that puts an account at
 risk.
