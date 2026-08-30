@@ -1,5 +1,19 @@
 # whatsapp
 
+> **There is a better one now.**
+> [**whatsapp-desktop**](https://github.com/abdallah-shehawey/whatsapp-desktop)
+> is the successor to this client, built on Electron and Chromium. It does
+> everything below and adds what WebKitGTK could not give this one: **voice and
+> video calls with screen sharing**, and notifications that are read from
+> WhatsApp Web's own store rather than inferred from its chat list — so reading
+> a message on your phone takes its notification down at once, a deleted message
+> takes its own with it, and a mention gets through a muted group without letting
+> the rest of the group through behind it. It is packaged in the same repository,
+> as `whatsapp-desktop`, and the two can be installed side by side.
+>
+> This one is still maintained and still works. It is 120 KB against 245 MB, so
+> if that trade is the one you want, it is here.
+
 A small WhatsApp Web client for GTK4 + WebKitGTK 6. The binary is around 120 KB.
 It loads `web.whatsapp.com`, so it is the same client WhatsApp serves to a
 browser — no reverse-engineered protocol, and nothing that puts an account at
